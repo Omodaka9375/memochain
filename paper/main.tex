@@ -21,8 +21,9 @@
 \title{\method{}: Verifiable Constant-Size Memory for Language Models}
 
 \author{%
-  Branislav \v{D}ali\'c\thanks{Code, full experimental logs, and the reproduction
-  pipeline accompany this paper in the repository (\texttt{github.com/Omodaka9375/memochain}).
+  Branislav \DJ{}ali\'c\thanks{Code, full experimental logs, and the reproduction
+  pipeline accompany this paper in the repository (\texttt{https://github.com/Omodaka9375/memochain},
+  archived at DOI \texttt{10.5281/zenodo.24497714}).
   Personal-session training data is scrubbed and withheld.}\\
 }
 \date{November 2026}
@@ -32,7 +33,7 @@
 
 \begin{abstract}
 Long-horizon LLM agents carry memory either as an ever-growing prompt
-(O(n) tokens per query) or as a vector store (O(n) index, no synthesis).
+($O(n)$ tokens per query) or as a vector store ($O(n)$ index, no synthesis).
 We present \method{}, a neural memory that is \emph{constant-size},
 \emph{streaming}, and \emph{cryptographically verifiable}. The entire
 history of a document collection or chat session folds into a fixed
@@ -153,20 +154,22 @@ head, payload hash, payload); a flipped bit fails the hash check loudly
 on load.
 
 \subsection{The fold}
-A document is a 2560-d embedding (Qwen3-Embedding-4B
-\cite{qwen3}), split into a key part and a value part. Head $h$ binds
-its own key slice to its own value slice through learned projections
-$W_{\text{key}}[h]$, $W_{\text{val}}[h]$:
+A document is a 2560-d Q14 embedding $x$ (Qwen3-Embedding-4B
+\cite{qwen3}). Learned integer linear layers map the full 2560-d
+embedding into 11 per-head keys and values ($W_{\text{key}},
+W_{\text{val}} \in \mathbb{Z}^{352 \times 2560}$ plus biases $b_{\text{key}},
+b_{\text{val}}$); writing head $h$'s 32-d block as $W_{\text{key}}[h]$,
+$b_{\text{key}}[h]$, $W_{\text{val}}[h]$, $b_{\text{val}}[h]$:
 \begin{align}
-k &= \operatorname{normalize}\!\left(W_{\text{key}}[h]\, x_{\text{key},h}\right)
+k &= \operatorname{normalize}\!\left((W_{\text{key}}[h]\, x \gg 14) + b_{\text{key}}[h]\right)
   && \text{Q14 unit key, integer }\sqrt{\cdot}\\
-v &= W_{\text{val}}[h]\, x_{\text{val},h}
+v &= \operatorname{clip}_{16}\!\left((W_{\text{val}}[h]\, x \gg 14) + b_{\text{val}}[h]\right)
   && \text{bounded int16}\\
 r &= (k S_h) \gg 14
   && \text{recalled value}\\
-\delta &= \beta (v - r) \gg 14
+\delta &= \beta_h (v - r) \gg 14
   && \text{correction}\\
-S_h &\leftarrow (\lambda S_h \gg 14) + (k \otimes \delta \gg 14)
+S_h &\leftarrow (\lambda_h S_h \gg 14) + (k \otimes \delta \gg 14)
   && \text{decay + rank-1 update}
 \end{align}
 This is the Delta rule of the fast-weight / linear-attention
@@ -269,11 +272,13 @@ leak from writer to reader.
 \subsection{Distilled reference (teacher comparison)}
 The distillation-trained student (kept as a comparison path) on
 pv4/test---4{,}237 questions, 30 unseen users, 200 documents each:
-\begin{table}[h]
+\begin{table}[ht]
 \centering
+\caption{Distilled reference on \texttt{pv4/test} (4{,}237 questions, 30 unseen users, 200 docs each).}
+\label{tab:distilled}
 \begin{tabular}{lrrr}
 \toprule
-Method & Memory/user & Accuracy & Hard acc.\\
+Method & Memory/user & Accuracy (\%) & Hard acc.\ (\%)\\
 \midrule
 closed-book & 0 & 58.58 & 31.80\\
 Memorilla teacher (KV cache) & 4.10\,MB & 64.76 & 38.16\\
@@ -291,11 +296,13 @@ horizon to 200 documents with no loss.
 \subsection{Self-trained (no teacher anywhere)}
 From scratch, 3{,}000 steps, batch 4 $\times$ grad-accum 2, through
 frozen decoders:
-\begin{table}[h]
+\begin{table}[ht]
 \centering
+\caption{End-to-end self-trained 22\,KB capsules (no teacher) on \texttt{pv4/test}.}
+\label{tab:e2e}
 \begin{tabular}{lrrl}
 \toprule
-Decoder & val NLL (zero $\to$ capsule) & Gain & QA (closed-book $\to$ capsule)\\
+Decoder & val NLL (zero $\to$ capsule) & Gain & QA \% (closed-book $\to$ capsule)\\
 \midrule
 Qwen3-0.6B & 5.24 $\to$ 3.53 & $+1.71$ nats & 50.77 $\to$ 57.02\\
 Qwen3-8B & 5.92 $\to$ 2.665 & $+3.25$ nats & 58.18 $\to$ \textbf{64.69} (hard 30.84 $\to$ 38.16)\\
@@ -303,9 +310,11 @@ Qwen3-8B & 5.92 $\to$ 2.665 & $+3.25$ nats & 58.18 $\to$ \textbf{64.69} (hard 30
 \end{tabular}
 \end{table}
 The 8B-trained capsule matches the Memorilla teacher's accuracy and
-hard-question accuracy exactly (64.69 vs.\ 64.76; 38.16 vs.\ 38.16)
+hard-question accuracy (64.69\% vs.\ 64.76\%; 38.16\% vs.\ 38.16\%)
 with the same frozen decoder, the same 22\,KB format, and zero teacher
-weights in training. For this benchmark, the self-trained
+weights in training. (Closed-book accuracy differs slightly between
+Tables~\ref{tab:distilled} and~\ref{tab:e2e}, 58.58\% vs.\ 58.18\%, due
+to separate vLLM evaluation runs.) For this benchmark, the self-trained
 constant-size capsule closes the entire gap between closed-book and a
 4.10\,MB attention cache.
 
@@ -318,8 +327,10 @@ negative result).
 \label{sec:capacity}
 Identical recipes across state sizes (frozen Qwen3-0.6B, 1{,}500
 steps, 30 fixed validation batches):
-\begin{table}[h]
+\begin{table}[ht]
 \centering
+\caption{Capacity scaling ablation on \texttt{pv4} (frozen Qwen3-0.6B, 1{,}500 steps, 30 fixed val batches).}
+\label{tab:capacity}
 \begin{tabular}{lrrrr}
 \toprule
 State & Size & Fact slots & Params & val gain (nats)\\
@@ -346,8 +357,10 @@ developer-terminal sessions (241 sessions; chronological docs include
 user turns, assistant replies, and compact tool-action summaries;
 every training question folds only documents strictly prior to that
 turn---zero future leakage; secrets scrubbed; session-level splits):
-\begin{table}[h]
+\begin{table}[ht]
 \centering
+\caption{Coding-domain transfer on held-out real sessions (147 causal QA rows, reloaded Q14 capsules).}
+\label{tab:coding}
 \begin{tabular}{lrr}
 \toprule
 Checkpoint & coding test NLL gain & pv4 gain retained\\
@@ -428,7 +441,7 @@ MEMORY-VQ~\cite{zemlyanskiy2023memoryvq} vector-quantizes precomputed
 token KV caches; \method{} instead trains a streaming associative state
 whose updates are $O(1)$ and integer-exact. \textbf{Verifiable ML}:
 zkDL~\cite{sun2023zkdl} proves deep-learning \emph{training}; \method{}
-applies recursive IVC to neural \emph{memory state} --- a much smaller,
+applies recursive IVC to neural \emph{memory state}---a much smaller,
 fixed computation, which is what makes 28\,ms verification of an
 unbounded history possible. \textbf{Mina / recursive SNARKs /
 SP1}~\cite{mina2020,sp1}: the constant-size-verifiable-state pattern and

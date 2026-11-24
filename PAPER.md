@@ -121,16 +121,17 @@ fails the hash check loudly on load.
 
 ### 2.2 The fold
 
-A document is a 2560-d embedding (Qwen3-Embedding-4B in our runs), split
-into a key part and a value part. Head h binds its own key slice to its own
-value slice through learned projections:
+A document is a 2560-d Q14 embedding (Qwen3-Embedding-4B in our runs).
+Learned integer linear layers map the full 2560-d embedding into 11
+per-head keys and values (`W_key`, `W_val` of shape `[352, 2560]` plus
+biases):
 
 ```text
-k = normalize(W_key[h] @ key_slice_h)      # Q14 unit key, integer sqrt
-v = W_val[h] @ value_slice_h               # bounded int16
+k = normalize((W_key[h] @ x >> 14) + b_key[h])     # Q14 unit key, integer sqrt
+v = clip16((W_val[h] @ x >> 14) + b_val[h])        # bounded int16
 recalled = (k @ S_h) >> 14
-delta    = beta * (v - recalled) >> 14
-S_h      = (decay * S_h >> 14) + (k outer delta >> 14)
+delta    = beta_h * (v - recalled) >> 14
+S_h      = (decay_h * S_h >> 14) + (k outer delta >> 14)
 ```
 
 This is the Delta rule (fast-weight / linear-attention family): writing a

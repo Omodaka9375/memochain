@@ -15,7 +15,7 @@ run `latexmk -pdf main.tex`, then upload `main.tex`, `references.bib`,
 and the generated `main.bbl` (arXiv does not run bibtex, so include the
 `.bbl` in the tarball).
 
-Author/anonymity note: the byline is currently `Anonymous` for a
-double-blind submission. For a non-anonymous release (arXiv, blog),
-replace the `\author{...}` block in `main.tex` and the author fields in
-`CITATION.cff` at the repository root.
+Author/anonymity note: `main.tex` and `CITATION.cff` carry the release
+author metadata. For a double-blind venue, temporarily replace the
+`\author{...}` block in `main.tex` with `Anonymous` on a separate build
+branch.
