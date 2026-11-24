@@ -7,7 +7,7 @@ that makes every memory write verifiable.
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24497714.svg)](https://doi.org/10.5281/zenodo.24497714)
 
-[Website](https://omodaka9375.github.io/memochain/) | [Paper (PDF)](paper/main.pdf) | [Paper (Markdown)](PAPER.md) | [LaTeX Source](paper/main.tex) | [Blog](BLOG.md) | [Experimental Log](DESIGN.md) | [License (Apache-2.0)](LICENSE) | [Citation](CITATION.cff)
+[Website](https://omodaka9375.github.io/memochain/) | [Paper (PDF)](paper/main.pdf) | [Paper (Markdown)](PAPER.md) | [LaTeX Source](paper/main.tex) | [Blog](https://omodaka9375.github.io/portfolio/#/blog/memochain-22kb-memory-with-a-proof) | [Experimental Log](DESIGN.md) | [License (Apache-2.0)](LICENSE) | [Citation](CITATION.cff)
 
 ```text
 Mina:      new_chain = fold(old_chain, block)  + recursive zk proof
