@@ -9,8 +9,17 @@ authors:
     family-names: Đalić
 version: 0.1.0
 date-released: "2026-11-24"
+doi: 10.5281/zenodo.24497714
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.24497714
+    description: Version 0.1.0 archive on Zenodo
+  - type: doi
+    value: 10.5281/zenodo.24497713
+    description: Concept DOI (all versions on Zenodo)
 license: Apache-2.0
 repository-code: "https://github.com/Omodaka9375/memochain"
+url: "https://omodaka9375.github.io/memochain/"
 abstract: >-
   Mina-style constant-size memory for LLMs: the whole history of a
   document collection or chat log collapses into a fixed 22 KB state,
