@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- MemoChain icon: neutral dark tile, folded 22 KB matrix block linked into a chain -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171717"/>
+      <stop offset="1" stop-color="#101010"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="108" fill="url(#tile)"/>
+  <rect x="6" y="6" width="500" height="500" rx="104" fill="none"
+        stroke="#333333" stroke-width="4"/>
+
+  <g filter="url(#glow)" fill="none" stroke-linecap="square" stroke-linejoin="miter">
+    <!-- Rear folded state layer (gray) -->
+    <rect x="176" y="176" width="208" height="208" stroke="#6a6a6a" stroke-width="40"/>
+    <!-- Front committed capsule state + diagonal fold M stroke (white) -->
+    <rect x="128" y="128" width="208" height="208" stroke="#e8e8e6" stroke-width="40"/>
+    <path d="M 164 292 L 164 176 L 232 240 L 300 176 L 300 292" stroke="#e8e8e6" stroke-width="32" stroke-linejoin="round"/>
+  </g>
+</svg>

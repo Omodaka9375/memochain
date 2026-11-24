@@ -1,0 +1,102 @@
+\begin{thebibliography}{15}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Authors(2026)]{memorilla2026}
+Memorilla Authors.
+\newblock Memorilla: Latent semantic memory for large language models.
+\newblock \emph{arXiv preprint arXiv:2610.21375}, 2026.
+
+\bibitem[Bowe et~al.(2020)Bowe, Ozer, and Roelse]{mina2020}
+Sean Bowe, Aslan Ozer, and Grigor Roelse.
+\newblock Mina: A concise blockchain protocol.
+\newblock \emph{IACR Cryptology ePrint Archive}, 2020.
+\newblock eprint 2020/375.
+
+\bibitem[Cabannes et~al.(2026)Cabannes, Mazar{\'e}, Szilvasy, Douze, Lomeli,
+  Auzina, Carpentier, Synnaeve, and J{\'e}gou]{cabannes2026sdm}
+Lo{\"i}c Cabannes, Pierre-Emmanuel Mazar{\'e}, Gergely Szilvasy, Matthijs
+  Douze, Maria Lomeli, Ilze~Amanda Auzina, Justin Carpentier, Gabriel Synnaeve,
+  and Herv{\'e} J{\'e}gou.
+\newblock Sparse delta memory: Scaling the state of linear rnns through
+  sparsity.
+\newblock \emph{arXiv preprint arXiv:2607.07386}, 2026.
+
+\bibitem[Chhikara et~al.(2025)Chhikara, Khant, Aryan, Singh, and
+  Yadav]{chhikara2025mem0}
+Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav.
+\newblock Mem0: Building production-ready ai agents with scalable long-term
+  memory.
+\newblock \emph{arXiv preprint arXiv:2504.19413}, 2025.
+
+\bibitem[Hatamizadeh et~al.(2026)Hatamizadeh, Choi, and
+  Kautz]{hatamizadeh2026gdn2}
+Ali Hatamizadeh, Yejin Choi, and Jan Kautz.
+\newblock Gated deltanet-2: Decoupling erase and write in linear attention.
+\newblock \emph{arXiv preprint arXiv:2605.22791}, 2026.
+
+\bibitem[Lewis et~al.(2020)Lewis, Perez, Piktus, Petroni, Karpukhin, Goyal,
+  K{\"u}ttler, Lewis, Yih, Rockt{\"a}schel, Riedel, and Kiela]{lewis2020rag}
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir
+  Karpukhin, Naman Goyal, Heinrich K{\"u}ttler, Mike Lewis, Wen-tau Yih, Tim
+  Rockt{\"a}schel, Sebastian Riedel, and Douwe Kiela.
+\newblock Retrieval-augmented generation for knowledge-intensive {NLP} tasks.
+\newblock \emph{Advances in Neural Information Processing Systems}, 33, 2020.
+
+\bibitem[Maharana et~al.(2024)Maharana, Lee, Tulyakov, Bansal, Barbieri, and
+  Fang]{maharana2024locomo}
+Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco
+  Barbieri, and Yuwei Fang.
+\newblock Evaluating very long-term conversational memory of llm agents.
+\newblock In \emph{Proceedings of ACL}, 2024.
+
+\bibitem[Packer et~al.(2023)Packer, Wooders, Lin, Fang, Patil, Stoica, and
+  Gonzalez]{packer2023memgpt}
+Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir~G. Patil, Ion
+  Stoica, and Joseph~E. Gonzalez.
+\newblock Memgpt: Towards llms as operating systems.
+\newblock In \emph{arXiv preprint arXiv:2310.08560}, 2023.
+
+\bibitem[{Qwen Team}(2025)]{qwen3}
+{Qwen Team}.
+\newblock Qwen3: The rise of reasoning-capable large language models.
+\newblock arXiv preprint arXiv:2505.09388, 2025.
+
+\bibitem[Schlag et~al.(2021)Schlag, Irie, and Schmidhuber]{schlag2021fast}
+Imanol Schlag, Kazuki Irie, and J{\"u}rgen Schmidhuber.
+\newblock Linear transformers are secretly fast weight memory models.
+\newblock \emph{International Conference on Machine Learning (ICML)}, 2021.
+
+\bibitem[{Succinct Labs}(2024)]{sp1}
+{Succinct Labs}.
+\newblock {SP1}: A performant, open-source zero-knowledge virtual machine.
+\newblock \url{https://github.com/succinctlabs/sp1}, 2024.
+
+\bibitem[Sun et~al.(2023)Sun, Bai, Li, and Zhang]{sun2023zkdl}
+Haochen Sun, Tonghe Bai, Jason Li, and Hongyang Zhang.
+\newblock zkdl: Efficient zero-knowledge proofs of deep learning training.
+\newblock \emph{arXiv preprint arXiv:2307.16273}, 2023.
+
+\bibitem[Wu et~al.(2024)Wu, Wang, Yu, Zhang, Chang, and Yu]{wu2024longmemeval}
+Di~Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu.
+\newblock Longmemeval: Benchmarking chat assistants on long-term interactive
+  memory.
+\newblock \emph{arXiv preprint arXiv:2410.10813}, 2024.
+
+\bibitem[Yang et~al.(2024)Yang, Wang, Zhang, Shen, and Kim]{yang2024delta}
+Songlin Yang, Bailin Wang, Yu~Zhang, Yikang Shen, and Yoon Kim.
+\newblock Parallelizing linear transformers with the delta rule over sequence
+  length.
+\newblock \emph{Advances in Neural Information Processing Systems}, 37, 2024.
+
+\bibitem[Zemlyanskiy et~al.(2024)Zemlyanskiy, de~Jong, Vilnis, Onta{\~n}{\'o}n,
+  Cohen, Sanghai, and Ainslie]{zemlyanskiy2023memoryvq}
+Yury Zemlyanskiy, Michiel de~Jong, Luke Vilnis, Santiago Onta{\~n}{\'o}n,
+  William~W. Cohen, Sumit Sanghai, and Joshua Ainslie.
+\newblock {MEMORY-VQ}: Compression for tractable internet-scale memory.
+\newblock \emph{Proceedings of NAACL}, 2024.
+
+\end{thebibliography}

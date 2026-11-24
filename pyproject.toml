@@ -1,0 +1,32 @@
+[project]
+name = "memochain"
+version = "0.1.0"
+description = "Mina-style constant-size (22 KB) recursive memory for LLMs"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+proxy = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+]
+train = [
+    "torch>=2.5",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.25",
+    "pyarrow>=18",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memochain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

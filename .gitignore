@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Tooling
+.git-commit-msg.tmp
+
+# Data and training artifacts (downloads, checkpoints, runs) - root only
+/data/
+/runs/
+/checkpoints/
+
+capsule*.bin
+memochain_*_proof.bin
+
+# Rust
+crates/*/target/
+crates/sp1/*/target/
+
+chain_input.json
+
+# LaTeX build intermediates (keep main.tex, references.bib, main.bbl, main.pdf)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.tar.gz

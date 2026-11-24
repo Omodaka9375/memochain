@@ -1,0 +1,8 @@
+[package]
+name = "memochain-core"
+version = "0.1.0"
+edition = "2021"
+description = "MemoChain integer Delta-rule fold: the ZK-ready core (bit-exact with the Python reference)"
+
+[dependencies]
+sha2 = "0.10.9"

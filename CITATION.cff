@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: MemoChain
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Branislav
+    family-names: Đalić
+version: 0.1.0
+date-released: "2026-11-24"
+license: Apache-2.0
+repository-code: "https://github.com/Omodaka9375/memochain"
+abstract: >-
+  Mina-style constant-size memory for LLMs: the whole history of a
+  document collection or chat log collapses into a fixed 22 KB state,
+  updated one document at a time in O(1), with a receipt chain (or a
+  full SP1 zkVM proof) that makes every memory write verifiable.
+keywords:
+  - language models
+  - memory
+  - fast weights
+  - zero-knowledge proofs
+  - verifiable computation

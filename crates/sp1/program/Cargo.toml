@@ -1,0 +1,15 @@
+[package]
+name = "memochain-program"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chain-logic = { path = "../../chain-logic" }
+memochain-core = { path = "../../memochain-core" }
+serde = { version = "1.0", features = ["derive"] }
+sp1-zkvm = "6.10.0"
+
+[features]
+# The zkVM guest compiles with the sp1 feature (entrypoint macro).
+default = []
