@@ -88,13 +88,28 @@ numbers that survive scrutiny.
 
 ## It runs live
 
-The stack behind this text is an OpenAI-compatible proxy: conversations
-start with no memory, past an 80,000-token window the oldest turns fold
-into the capsule, memory notes are injected into the system prompt, and
-a background queue replays every fold inside the SP1 zkVM, checking the
-capsule's step, state digest, accumulator, and weights digest against
-its receipt chain. Tampering with the capsule is a hash mismatch, not a
-silent corruption.
+The stack behind this text is a slim (~55 MB RAM, zero extra GPU) proxy
+supporting both OpenAI `/v1/chat/completions` and native Anthropic
+`/v1/messages` with BYOK key pass-through, running in front of local
+servers (vLLM, llama.cpp, Ollama) or cloud routers (OpenRouter, direct
+Anthropic). Conversations start with zero overhead; past an 80,000-token
+window the oldest turns fold into the 22 KB capsule and SHA-256 receipt
+chain, and an optional background queue replays every fold inside the SP1
+zkVM. Tampering with the capsule is a hash mismatch, not a silent
+corruption.
+
+One practical lesson from daily use: a 22 KB neural state preserves gist
+and preferences, while a coding session also needs exact verbatim recall
+of ports, hashes, and paths - and hosting a second 18 GB neural reader
+model defeats the point of a lightweight proxy. So the default `hybrid`
+mode pairs the verifiable 22 KB capsule with a reader-free recall layer (a
+rolling bullet fact sheet from the active backend plus an int8-quantized,
+FIFO-capped SQLite store for top-K verbatim snippets; outside the ZK
+circuit, stated plainly in the paper's honesty audit). Two containers
+sharing one session volume carry the same `x-session-id` across local and
+cloud models. On a 120-turn A/B replay metered by the backend's own
+`usage.prompt_tokens`, total input tokens dropped from 7,086,360 to
+674,016 - a 90% reduction.
 
 ## What is next
 
@@ -106,9 +121,10 @@ revoked document - is the most direct application of the receipt chain,
 and it is unbuilt.
 
 The paper, the full experimental log (including negative results), the
-Rust and zkVM implementations, the training pipeline, and the live proxy
-are all in the repository. The core and its 67 tests run on a laptop CPU;
-training fits a single 12 GB GPU; proofs run on Linux/ARM.
+Rust and zkVM implementations, the training pipeline, the savings
+benchmark, and the live proxy are all in the repository. The core and its
+76 Python tests (plus 14 Rust tests) run on a laptop CPU; training fits a
+single 12 GB GPU; proofs run on Linux/ARM.
 
 Memory for long-horizon agents can be constant-size, portable, and
 honest at the same time. That is the whole thesis - in 22 KB.

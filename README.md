@@ -38,16 +38,19 @@ state digests in Python, native Rust, and the SP1 zkVM.
   STARK proves the whole 200-doc fold (1.24 MiB, ~24 min prove on DGX
   Spark) and a +1-doc recursive step costs 33.8M cycles; anyone verifies
   in ~28 ms.
-- **OpenAI-compatible memory proxy** (`server/`): drop it in front of any
-  chat backend; it folds overflow history into the 22 KB capsule, injects
-  memory notes into the system prompt, and runs the SP1 proof queue in the
-  background.
+- **OpenAI + Anthropic memory proxy** (`server/`): single ~55 MB RAM,
+  zero-GPU container sitting in front of any local or cloud backend
+  (`/v1/chat/completions` + native `/v1/messages`, BYOK key pass-through).
+  Folds overflow into the 22 KB capsule + SHA-256 receipt chain, pairs it
+  with hybrid recall (rolling fact sheet + int8 FIFO-capped SQLite chunks),
+  shares sessions across local and cloud containers via one `/data` volume,
+  and runs the optional SP1 proof queue in the background.
 
 ## Quickstart
 
 ```bash
 uv sync --extra dev
-uv run pytest              # 67 Python tests (torch tests skip if absent)
+uv run pytest              # 76 Python tests (torch tests skip if absent) + 14 Rust tests
 uv run demo.py             # fold, read, verify, tamper-check, benchmark
 ```
 
@@ -92,12 +95,12 @@ reference numbers (Qwen3-8B decoder, pv4/test): 22 KB capsule 64.67% vs
 Memorilla teacher 64.76% (4.10 MB KV cache) vs closed-book 58.58% - 98.5% of
 the teacher's memory gain at 181.8x compression. See DESIGN.md Phase 10.
 
-## Memory proxy (OpenAI-compatible)
+## Memory proxy (OpenAI + Anthropic, BYOK, shared sessions)
 
-By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus per-session SQLite chunk retrieval alongside the exact 22 KB Q14 capsule and sha256 receipt chain.
+By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus an int8-quantized, FIFO-capped per-session SQLite chunk store (default 2,000 chunks, ~7 MB max/session) alongside the exact 22 KB Q14 capsule and SHA-256 receipt chain.
 
 ```bash
-# Single Docker container (recommended, ~57 MB RAM, 0 extra GPU)
+# Docker (recommended: starts :9000 local + :9001 OpenRouter on a shared /data volume)
 docker compose up -d
 
 # Or directly via Python
@@ -108,25 +111,37 @@ PYTHONPATH=src python -m memochain.server \
     --port 9000
 ```
 
-Point any OpenAI client at `http://localhost:9000/v1` (or any Anthropic
-`/v1/messages` client such as Claude Code at `http://localhost:9000`).
+Point any OpenAI client at `http://localhost:9000/v1` (local) or
+`http://localhost:9001/v1` (OpenRouter), or any Anthropic `/v1/messages`
+client such as Claude Code at `http://localhost:9000`. With the same
+`x-session-id` header, a session can start on a local model and continue
+on a cloud model with the same capsule and history via the shared volume.
+Client API keys (`Authorization` / `x-api-key`) pass through verbatim for
+both chat and fold-summary calls (BYOK); `MEMOCHAIN_BACKEND_API_KEY` is
+only an optional fallback.
+
 Supported backends via `MEMOCHAIN_BACKEND_BASE_URL` / `--backend-base-url`:
 
 - **Local OpenAI-compatible (default)**: vLLM (e.g. `http://localhost:8000/v1`),
   llama.cpp server, Ollama (`http://localhost:11434/v1`), LM Studio.
-- **OpenRouter**: `https://openrouter.ai/api/v1` (with `MEMOCHAIN_BACKEND_API_KEY`
-  or client pass-through key).
+- **OpenRouter**: `https://openrouter.ai/api/v1` (BYOK pass-through or
+  `MEMOCHAIN_BACKEND_API_KEY`).
 - **Direct Anthropic**: `https://api.anthropic.com/v1`.
 
-Sessions start with zero memory; once the conversation exceeds `--hot-limit` tokens (default
-80,000, conversation only) the oldest turns fold into the 22 KB capsule,
-recalled facts + top-K verbatim chunks are injected into the system prompt,
-and the optional SP1 queue replays the fold in the background
+Sessions start with zero memory overhead; once the conversation exceeds
+`--hot-limit` tokens (default 80,000, conversation only; folding down to
+40,000) the oldest turns fold into the 22 KB capsule, recalled facts +
+top-K verbatim chunks are injected into the system prompt, and the
+optional SP1 queue replays the fold in the background
 (`/v1/memochain/verify` reports capsule, receipt chain, and proof status).
 Optional flags: `--reader-backend transformers` (in-process neural reader),
 `--reader-backend profile` (numpy recall profile only), `--reader-sidecar-url`,
-`--embedding-base-url`, and `--proof-mode execute`. The chat backend is
-swappable; the writer is torch-free in production.
+`--embedding-base-url`, `--max-chunks`, and `--proof-mode execute`.
+
+Measured savings (`tools/benchmark_savings.py`, 120-turn identical session,
+backend-metered `usage.prompt_tokens`): 7,086,360 input tokens direct vs
+674,016 through the proxy (**90% reduction**, final-turn prompt 117,125 to
+6,746 tokens). See `tools/bench_results/savings_report.md`.
 
 ## ZK proofs (Linux / SP1)
 
@@ -140,18 +155,23 @@ cd ../script && cargo build --release --bin ivc
 
 ## Status
 
-Phases 1-17 complete: integer Delta-rule fold (bit-identical across
+Phases 1-21 complete: integer Delta-rule fold (bit-identical across
 machines), O(1) receipt chain, versioned capsules, distilled student +
 end-to-end distillation-free training (Qwen3-8B e2e matches the Memorilla
 teacher's held-out accuracy at 64.69% vs 64.76% from the 22 KB capsule with
 zero teacher weights), exact Q14 writer, Mina-style recursive SP1 IVC proofs,
-live OpenAI-compatible proxy, capacity scaling ablation (gain saturates by
-10 KiB; the 22 KiB Mina-sized state is past the knee), and coding-domain
-transfer on real sessions. Everything except the Qwen3-8B benchmarks runs on
-a 12 GB GPU or CPU only. See [DESIGN.md](DESIGN.md) for the phase-by-phase
-results and negative results.
+capacity scaling ablation (gain saturates by 10 KiB; the 22 KiB Mina-sized
+state is past the knee), coding-domain transfer on real sessions, slim
+single-container hybrid proxy (OpenAI + Anthropic `/v1/messages`, BYOK
+pass-through, int8 FIFO-capped SQLite recall, cross-container shared
+sessions), and a 120-turn A/B benchmark measuring 90% input-token
+reduction. Everything except the Qwen3-8B benchmarks runs on a 12 GB GPU
+or CPU only. See [DESIGN.md](DESIGN.md) for the phase-by-phase results
+and negative results.
 
-Known limits (detailed in DESIGN.md): the 22 KB state holds gist and
-preferences well (~350 orthogonal fact slots) but cannot store verbatim
-long lists; capsules are bound to one embedding geometry (Qwen3-Embedding-4B)
-plus a reader checkpoint; SP1 prove times are minutes on CPU-class hosts.
+Known limits (detailed in DESIGN.md and PAPER.md Section 6): the 22 KB
+state holds gist and preferences well (~350 orthogonal fact slots) but
+cannot store verbatim long lists (which is why the default live proxy pairs
+it with bounded SQLite hybrid recall, outside the ZK circuit); capsules
+are bound to one embedding geometry (Qwen3-Embedding-4B) plus a reader
+checkpoint; SP1 prove times are minutes on CPU-class hosts.

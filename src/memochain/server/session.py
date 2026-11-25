@@ -326,6 +326,7 @@ class SessionMemory:
         self.state: MemoryState | None = None
         self.head: ChainHead | None = None
         self.tampered = False
+        self._meta_mtime_ns: int = -1
         self._load()
 
     # ---- persistence ----------------------------------------------------
@@ -345,10 +346,12 @@ class SessionMemory:
     def _load(self) -> None:
         if not self.meta_path.exists():
             return
+        self._meta_mtime_ns = self.meta_path.stat().st_mtime_ns
         meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         self.folded_hashes = list(meta.get("folded_hashes", []))
         self._folded_set = set(self.folded_hashes)
         self.summary = meta.get("summary", "")
+        self.tampered = False
         if not (self.capsule_path.exists() and meta.get("state_digest")):
             return
         try:
@@ -367,6 +370,14 @@ class SessionMemory:
             # silently continuing on bad state.
             self.tampered = True
 
+    def sync_from_disk(self) -> None:
+        """Reload meta/capsule if another proxy process updated this session."""
+        if not self.meta_path.exists():
+            return
+        mtime_ns = self.meta_path.stat().st_mtime_ns
+        if mtime_ns != self._meta_mtime_ns:
+            self._load()
+
     def _save(self) -> None:
         meta = {
             "session_id": self.session_id,
@@ -381,6 +392,7 @@ class SessionMemory:
         tmp = self.meta_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, self.meta_path)
+        self._meta_mtime_ns = self.meta_path.stat().st_mtime_ns
 
     def _append_receipts(self, rows: list[dict[str, Any]]) -> None:
         with open(self.receipts_path, "a", encoding="utf-8") as fh:

@@ -97,9 +97,12 @@ Contributions:
    swaps move choice accuracy by only 1-2 pp; we therefore report NLL gains
    as the primary metric and publish the decomposition analysis, negative
    results included.
-7. **A deployed system** (Section 7): an OpenAI-compatible proxy that folds
-   conversation overflow into the capsule live, injects memory notes into
-   the system prompt, and runs the zkVM proof queue in the background.
+7. **A deployed system** (Section 5.5): a slim (~55 MB RAM, zero-GPU)
+   OpenAI- and Anthropic-compatible memory proxy that folds conversation
+   overflow into the verifiable 22 KB capsule, pairs it with a hybrid
+   recall layer for exact entity retrieval, shares sessions across local
+   and cloud backends, and cuts backend-metered input tokens by 90% over a
+   120-turn session.
 
 ## 2. The 22 KB memory state
 
@@ -313,18 +316,41 @@ launch scripts) where the pv4-only model hallucinates a generic project.
 
 ### 5.5 Live system
 
-The proxy runs daily in front of a local chat backend. Sessions start with
-no memory; past an 80,000-token conversation window (system prompt excluded,
-never folded), the oldest turns fold into the capsule, memory notes are
-injected into the system prompt, and the background queue replays each
-fold in the zkVM, checking step, state digest, accumulator, and weights
-digest against the capsule and receipt chain. Folding 34 messages / 6,044
-tokens produces the 22,606-byte capsule in milliseconds; the execute check
-takes ~13 s.
+The proxy ships as a single pure-NumPy container (~51-57 MB RSS, zero
+extra GPU memory, 235 MB image) supporting both OpenAI
+`/v1/chat/completions` and native Anthropic `/v1/messages` with BYOK
+header pass-through, and runs in front of local servers (vLLM, llama.cpp,
+Ollama) as well as cloud routers (OpenRouter, direct Anthropic). Two
+containers sharing one session volume reload state on demand via
+metadata-mtime checks, allowing a session keyed by `x-session-id` to start
+on a local model and continue on a cloud model with the same capsule and
+history.
+
+Sessions start with zero overhead; past an 80,000-token hot window (system
+prompt excluded, never folded; folding down to 40,000 tokens), overflowing
+turns fold deterministically into the 22,606-byte capsule in milliseconds
+and append to the SHA-256 receipt chain, with an optional background queue
+that replays each fold in the SP1 zkVM (~13 s in execute mode for a
+34-message / 6,044-token batch). For text-level injection in daily use,
+the default `hybrid` mode pairs the verifiable capsule with a reader-free
+recall layer: one short call per fold to the active backend updates a
+rolling bullet fact sheet, and an int8-quantized, FIFO-capped local SQLite
+store (default 2,000 chunks, ~7 MB max/session) supplies top-k verbatim
+snippets. The optional trained neural reader remains available via
+`--reader-backend transformers`.
+
+We benchmarked the live proxy by replaying an identical 120-turn
+conversation (~1,200 tokens/turn, 8k test hot window to trigger 38 folds)
+directly against a local vLLM server and through the proxy, recording the
+backend's own `usage.prompt_tokens`: total input tokens dropped from
+7,086,360 to 674,016 (**90% reduction**; final-turn prompt 117,125 to
+6,746 tokens). On a 4-entity live recall probe after folding out early
+turns, hybrid recall answered 4/4 exact entities (city, tool, secret
+token, host:port) versus 0/4 with the deterministic capsule profile alone.
 
 ## 6. Honesty audit
 
-We report three uncomfortable measurements rather than bury them:
+We report four uncomfortable measurements rather than bury them:
 
 1. **Choice-accuracy deltas understate the memory signal.** Swapping the
    real capsule for a zeroed state or a wrong-session capsule changes
@@ -338,7 +364,17 @@ We report three uncomfortable measurements rather than bury them:
    roughly 160 KB of text into 22 KB: gist and preferences survive;
    verbatim long lists do not. The capacity section bounds where this
    bites.
-3. **Embedding lock-in.** Capsules are bound to one embedding geometry
+3. **Trained neural reader vs live hybrid recall.** In live deployment
+   against arbitrary out-of-distribution chats, the 16-token trained
+   neural reader frequently decodes training-distribution priors rather
+   than exact live entities (ports, hashes, arbitrary identifiers), and
+   requires hosting a second reader LM. The production proxy therefore
+   defaults to hybrid recall (Section 5.5) for verbatim reliability while
+   still maintaining and verifying the 22 KB capsule and SHA-256 receipt
+   chain on every fold. Crucially, the receipt chain and SP1 proofs cover
+   the 22 KB capsule and committed document hashes, not the SQLite chunks
+   or LLM-written fact bullets.
+4. **Embedding lock-in.** Capsules are bound to one embedding geometry
    and a reader checkpoint. Portability across embedding models requires
    retraining or an adapter; the capsule is portable across processes and
    machines, not across encoders.
@@ -362,8 +398,10 @@ evaluation used Qwen-family models.
 - **Mina / recursive SNARKs / SP1**: the constant-size-verifiable-state
   pattern and the IVC recursion structure; MemoChain applies them to
   neural state.
-- **RAG / vector stores**: complementary for verbatim recall; MemoChain
-  targets gist, synthesis, and constant-size trust.
+- **RAG / vector stores**: complementary for verbatim recall; MemoChain's
+  core capsule targets gist, synthesis, and constant-size trust, and the
+  deployed proxy (Section 5.5) shows how it composes cleanly with a
+  bounded verbatim store when exact entity recall is needed.
 
 ## 8. Limitations and future work
 
@@ -390,8 +428,10 @@ constant-size, portable, and honest at the same time.
 
 ## Reproducing
 
-Everything runs from the repository: the pure-NumPy core and 67 tests on a
-laptop CPU; e2e training on a single 12 GB GPU; SP1 proofs on Linux/ARM
-(see crates/sp1/README.md); the proxy on any host with an OpenAI backend.
-See README.md for quickstart commands and DESIGN.md for the full
-phase-by-phase experimental log.
+Everything runs from the repository: the pure-NumPy core and 76 Python
+tests (plus 14 Rust tests) on a laptop CPU; e2e training on a single 12 GB
+GPU; SP1 proofs on Linux/ARM (see crates/sp1/README.md); the proxy in a
+single 235 MB container in front of any OpenAI- or Anthropic-compatible
+backend. See README.md for quickstart commands,
+`tools/benchmark_savings.py` for the token-savings benchmark, and
+DESIGN.md for the full phase-by-phase experimental log.

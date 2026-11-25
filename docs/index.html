@@ -508,10 +508,10 @@
             <tr><td>domains</td><td><b>Domain transfer.</b> Trained on a real developer's 241 coding sessions: coding recall doubles, 96.6% of the QA gain stays.</td></tr>
 
             <tr class="group"><td colspan="2">The deployment</td></tr>
-            <tr><td>proxy</td><td><b>OpenAI + Anthropic APIs.</b> Drop-in proxy on <code>/v1/chat/completions</code> and native <code>/v1/messages</code> (Claude Code, OpenRouter, direct Anthropic, vLLM, llama.cpp, Ollama).</td></tr>
-            <tr><td>container</td><td><b>Single slim container.</b> ~52 MB RAM, 0 extra GPU, 235 MB image, 2-second boot. Default hybrid mode pairs the 22 KB Q14 capsule with a rolling fact sheet and int8 SQLite chunk recall (capped at 2,000 chunks).</td></tr>
+            <tr><td>proxy</td><td><b>OpenAI + Anthropic APIs + BYOK.</b> Drop-in proxy on <code>/v1/chat/completions</code> and native <code>/v1/messages</code> (Claude Code, OpenRouter, direct Anthropic, vLLM, llama.cpp, Ollama) with client key pass-through.</td></tr>
+            <tr><td>container</td><td><b>Single slim container + shared sessions.</b> ~51–57 MB RAM, 0 extra GPU, 235 MB image, 2-second boot. Default hybrid mode pairs the 22 KB Q14 capsule with a rolling fact sheet and int8 SQLite chunk recall (capped at 2,000 chunks). Two containers sharing a volume carry the same <code>x-session-id</code> seamlessly across local and cloud models.</td></tr>
             <tr><td>audit</td><td><b>Background proofs.</b> The proxy's proof queue replays each fold in the zkVM and verifies the capsule against its SHA-256 receipt chain via <code>/v1/memochain/verify</code>.</td></tr>
-            <tr><td>tests</td><td><b>74 Python + 14 Rust tests.</b> Core and proxy run on any CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
+            <tr><td>tests</td><td><b>76 Python + 14 Rust tests.</b> Core and proxy run on any CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
           </tbody>
         </table>
       </div>
@@ -599,6 +599,7 @@
             <tr><td>teacher weights in training</td><td>—</td><td>is the teacher</td><td><b>none, ever</b></td></tr>
             <tr><td>capacity knee</td><td>—</td><td>—</td><td><b>10 KiB (22 KiB is past the knee)</b></td></tr>
             <tr><td>coding recall (241 real sessions)</td><td>—</td><td>—</td><td><b>+1.76 nats, 96.6% QA retention</b></td></tr>
+            <tr><td>live proxy savings (120-turn A/B)</td><td>7,086,360 input tok</td><td>—</td><td><b>674,016 input tok (−90% backend-metered)</b></td></tr>
           </tbody>
         </table>
         </div>
@@ -619,9 +620,10 @@
         </div>
         <h2>Run it in four commands.</h2>
         <p class="lead">
-          Core + 74 tests on a laptop CPU; single-container hybrid proxy in
-          52 MB RAM for local models, OpenRouter, or Claude; training on a
-          single 12 GB GPU; proofs on Linux/ARM.
+          Core + 76 tests on a laptop CPU; single-container hybrid proxy in
+          ~55 MB RAM for local models, OpenRouter, or Claude (with shared
+          cross-model sessions); training on a single 12 GB GPU; proofs on
+          Linux/ARM.
         </p>
         <div class="os-tabs" role="tablist" id="osTabs">
           <button class="os-tab" role="tab" data-os="proxy" aria-selected="true">Proxy</button>
@@ -632,9 +634,9 @@
         <div class="os-panel active" data-os="proxy">
           <div class="os-card">
             <h4>Single-container memory proxy (hybrid default)</h4>
-            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet.</p>
+            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet. Bundled compose runs both <code>:9000</code> (local) and <code>:9001</code> (OpenRouter) on one shared session volume.</p>
             <div class="codebox">
-            <pre># Docker (recommended: 235 MB image, ~52 MB RAM, 0 extra GPU)
+            <pre># Docker (starts :9000 local + :9001 OpenRouter, ~55 MB RAM each, 0 GPU)
 docker compose up -d
 
 # Or directly via Python
@@ -645,7 +647,7 @@ PYTHONPATH=src python -m memochain.server \
             </div>
             <div class="os-meta">
               <span>Endpoints <b>/v1/chat/completions · /v1/messages · /v1/memochain/verify</b></span>
-              <span>Footprint <b>~52 MB RAM · 0 GPU</b></span>
+              <span>Footprint <b>~55 MB RAM · 0 GPU</b></span>
               <span>Hot window <b>80k / 40k tokens</b></span>
             </div>
           </div>
@@ -656,7 +658,7 @@ PYTHONPATH=src python -m memochain.server \
             <p>Fold, read, verify, tamper-check, benchmark. No torch, no GPU, no downloads.</p>
             <div class="codebox">
             <pre>uv sync --extra dev
-uv run pytest          # 74 tests (torch tests skip if absent)
+uv run pytest          # 76 Python tests (torch tests skip if absent)
 uv run demo.py</pre>
             <button class="copy" type="button" aria-label="Copy commands">Copy</button>
             </div>

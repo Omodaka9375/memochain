@@ -130,9 +130,12 @@ the original domain's gain.
 wrong-session capsule swaps move choice accuracy by only 1--2\,pp; we
 report NLL gains as the primary metric and publish the decomposition
 analysis and negative results.
-\item A deployed system (\S\ref{sec:live}): an OpenAI-compatible proxy
-that folds conversation overflow into the capsule live and runs the
-zkVM proof queue in the background.
+\item A deployed system (\S\ref{sec:live}): a slim (${\sim}55$\,MB RAM,
+zero-GPU) OpenAI- and Anthropic-compatible memory proxy that folds
+conversation overflow into the verifiable 22\,KB capsule, pairs it with a
+hybrid recall layer for exact entity retrieval, shares sessions across
+local and cloud backends, and cuts backend-metered input tokens by 90\%
+over a 120-turn session.
 \end{enumerate}
 
 \section{The 22\,KB Memory State}
@@ -382,19 +385,43 @@ hallucinates a generic project.
 
 \subsection{Live system}
 \label{sec:live}
-The proxy runs daily in front of a local chat backend. Sessions start
-with no memory; past an 80{,}000-token conversation window (system
-prompt excluded, never folded), the oldest turns fold into the
-capsule, memory notes are injected into the system prompt, and the
-background queue replays each fold in the zkVM, checking step, state
-digest, accumulator, and weights digest against the capsule and
-receipt chain. Folding 34 messages / 6{,}044 tokens produces the
-22{,}606-byte capsule in milliseconds; the execute check takes
-${\sim}13$\,s.
+The proxy ships as a single pure-NumPy container (${\sim}51$--$57$\,MB
+RSS, zero extra GPU memory, 235\,MB image) supporting both the OpenAI
+\texttt{/v1/chat/completions} and Anthropic \texttt{/v1/messages} APIs
+with BYOK header pass-through, and runs in front of local servers
+(vLLM, llama.cpp, Ollama) as well as cloud routers (OpenRouter, direct
+Anthropic). Two containers sharing one session volume reload state on
+demand via metadata-mtime checks, allowing a session keyed by
+\texttt{x-session-id} to start on a local model and continue on a cloud
+model with the same capsule and history.
+
+Sessions start with zero overhead; past an 80{,}000-token hot window
+(system prompt excluded, never folded; folding down to 40{,}000 tokens),
+overflowing turns fold deterministically into the 22{,}606-byte capsule
+in milliseconds and append to the SHA-256 receipt chain, with an optional
+background queue that replays each fold in the SP1 zkVM (${\sim}13$\,s in
+execute mode for a 34-message / 6{,}044-token batch). For text-level
+injection in daily use, the default \texttt{hybrid} mode pairs the
+verifiable capsule with a reader-free recall layer: one short call per
+fold to the active backend updates a rolling bullet fact sheet, and an
+int8-quantized, FIFO-capped local SQLite store (default 2{,}000 chunks,
+${\sim}7$\,MB max/session) supplies top-$k$ verbatim snippets. The
+optional trained neural reader remains available via
+\texttt{--reader-backend transformers}.
+
+We benchmarked the live proxy by replaying an identical 120-turn
+conversation (${\sim}1{,}200$ tokens/turn, 8k test hot window to trigger
+38 folds) directly against a local vLLM server and through the proxy,
+recording the backend's own \texttt{usage.prompt\_tokens}: total input
+tokens dropped from 7{,}086{,}360 to 674{,}016 (\textbf{90\% reduction};
+final-turn prompt 117{,}125 $\to$ 6{,}746 tokens). On a 4-entity live
+recall probe after folding out early turns, hybrid recall answered 4/4
+exact entities (city, tool, secret token, host:port) versus 0/4 with the
+deterministic capsule profile alone.
 
 \section{Honesty Audit}
 \label{sec:honesty}
-We report three uncomfortable measurements rather than bury them:
+We report four uncomfortable measurements rather than bury them:
 \begin{enumerate}
 \item \textbf{Choice-accuracy deltas understate the memory signal.}
 Swapping the real capsule for a zeroed state or a wrong-session
@@ -408,6 +435,16 @@ question-bypassed reader energy is future work.
 into 22\,KB is roughly 160\,KB of text into 22\,KB: gist and
 preferences survive; verbatim long lists do not. \S\ref{sec:capacity}
 bounds where this bites.
+\item \textbf{Trained neural reader vs.\ live hybrid recall.} In live
+deployment against arbitrary out-of-distribution chats, the 16-token
+trained neural reader frequently decodes training-distribution priors
+rather than exact live entities (ports, hashes, arbitrary identifiers),
+and requires hosting a second reader LM. The production proxy therefore
+defaults to hybrid recall (\S\ref{sec:live}) for verbatim reliability
+while still maintaining and verifying the 22\,KB capsule and SHA-256
+receipt chain on every fold. Crucially, the receipt chain and SP1 proofs
+cover the 22\,KB capsule and committed document hashes, \emph{not} the
+SQLite chunks or LLM-written fact bullets.
 \item \textbf{Embedding lock-in.} Capsules are bound to one embedding
 geometry and a reader checkpoint. The capsule is portable across
 processes and machines, not across encoders.
@@ -429,9 +466,10 @@ manages memory tiers by paging text through a context window;
 Mem0~\cite{chhikara2025mem0} maintains an external fact store via
 LLM-driven CRUD operations; LongMemEval~\cite{wu2024longmemeval} and
 LoCoMo~\cite{maharana2024locomo} benchmark such systems on multi-session
-recall. \method{} compresses the same histories into a single
-constant-size artifact with a proof, rather than storing and retrieving
-growing text. \textbf{Fast weights / DeltaNet / linear
+recall. \method{}'s core capsule compresses the same histories into a single
+constant-size artifact with a proof, and the deployed proxy
+(\S\ref{sec:live}) shows how it composes cleanly with a bounded
+verbatim store when exact entity recall is needed. \textbf{Fast weights / DeltaNet / linear
 attention}~\cite{schlag2021fast,yang2024delta,hatamizadeh2026gdn2,cabannes2026sdm}:
 the write rule is from this family, and recent work scales its state or
 gates; \method{}'s contribution is making it fixed-point exact,
@@ -470,11 +508,13 @@ turns memory tampering into a hash mismatch; and proves its own writes
 in a zkVM with 28\,ms verification. Memory for long-horizon agents can
 be constant-size, portable, and honest at the same time.
 
-\paragraph{Reproducing.} The pure-NumPy core and 67 tests run on a
-laptop CPU; e2e training runs on a single 12\,GB GPU; SP1 proofs run on
-Linux/ARM; the proxy runs on any host with an OpenAI backend. The
-repository contains the full phase-by-phase experimental log
-(\textsc{DESIGN.md}).
+\paragraph{Reproducing.} The pure-NumPy core and 76 Python tests (plus
+14 Rust tests) run on a laptop CPU; e2e training runs on a single 12\,GB
+GPU; SP1 proofs run on Linux/ARM; the proxy runs in a single 235\,MB
+container in front of any OpenAI- or Anthropic-compatible backend. The
+repository contains the savings benchmark harness
+(\texttt{tools/benchmark\_savings.py}) and the full phase-by-phase
+experimental log (\textsc{DESIGN.md}).
 
 \bibliographystyle{plainnat}
 \bibliography{references}

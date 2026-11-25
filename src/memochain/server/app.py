@@ -543,6 +543,8 @@ class SessionManager:
         sid = "".join(c if c.isalnum() or c in "-_" else "-" for c in session_id)[:80]
         if sid not in self.sessions:
             self.sessions[sid] = SessionMemory(sid, self.store_root / sid, **self.session_kwargs)
+        else:
+            self.sessions[sid].sync_from_disk()
         return self.sessions[sid]
 
     def get_by_id(self, session_id: str) -> SessionMemory:
@@ -550,6 +552,8 @@ class SessionManager:
         sid = "".join(c if c.isalnum() or c in "-_" else "-" for c in session_id)[:80]
         if sid not in self.sessions:
             self.sessions[sid] = SessionMemory(sid, self.store_root / sid, **self.session_kwargs)
+        else:
+            self.sessions[sid].sync_from_disk()
         return self.sessions[sid]
 
 

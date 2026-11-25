@@ -50,6 +50,26 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  memochain-openrouter:
+    image: memochain:latest
+    container_name: memochain-openrouter
+    ports:
+      - "9001:9000"
+    environment:
+      MEMOCHAIN_BACKEND_BASE_URL: https://openrouter.ai/api/v1
+      # MEMOCHAIN_BACKEND_API_KEY: sk-or-v1-...                         # optional: clients can pass their own key (BYOK)
+      MEMOCHAIN_CHECKPOINT: /checkpoints/student
+      MEMOCHAIN_STORE_ROOT: /data/sessions
+      MEMOCHAIN_READER_BACKEND: hybrid
+      # MEMOCHAIN_RECALL_TOP_K: "4"
+      # MEMOCHAIN_MAX_CHUNKS: "2000"
+      # MEMOCHAIN_HOT_LIMIT: "80000"
+      # MEMOCHAIN_KEEP_MIN: "40000"
+    volumes:
+      - ./checkpoints:/checkpoints:ro
+      - memochain-data:/data                                            # shared session memory with :9000
+    restart: unless-stopped
+
   # embedding:
   #   image: vllm/vllm-openai:latest
   #   command: --model Qwen/Qwen3-Embedding-4B --served-model-name bge --port 8001

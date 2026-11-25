@@ -348,7 +348,7 @@ def test_hybrid_read_fold_and_chunk_retrieval(tmp_path) -> None:
             return prev_summary
 
         def read_fold(self, state, query_embed, prev_summary: str, folded_entries) -> str:
-            return "- city: Novi Sad\n- tool: pnpm"
+            return "- city: Lisbon\n- tool: pnpm"
 
     s = SessionMemory(
         "h1",
@@ -361,8 +361,8 @@ def test_hybrid_read_fold_and_chunk_retrieval(tmp_path) -> None:
         recall_top_k=2,
     )
     conv = [
-        msg("user", "My city is Novi Sad and I use pnpm for packages. Secret code: ZEBRA-42."),
-        msg("assistant", "Got it, Novi Sad, pnpm, ZEBRA-42."),
+        msg("user", "My city is Lisbon and I use pnpm for packages. Secret code: ZEBRA-42."),
+        msg("assistant", "Got it, Lisbon, pnpm, ZEBRA-42."),
         msg("user", "Let us also note the database port is 5432 and host is db.internal. " + ("x" * 300)),
         msg("assistant", "Noted port 5432 and host db.internal. " + ("y" * 300)),
         msg("user", "What is my secret code ZEBRA-42 and package manager?"),
@@ -372,7 +372,7 @@ def test_hybrid_read_fold_and_chunk_retrieval(tmp_path) -> None:
     assert stats["recalled_chunks"] == 2
     sys_content = out[0]["content"]
     assert "[Durable memory]" in sys_content
-    assert "- city: Novi Sad" in sys_content
+    assert "- city: Lisbon" in sys_content
     assert "Relevant verbatim turns recalled" in sys_content
     assert "ZEBRA-42" in sys_content
     assert s.verify()["ok"] is True
@@ -402,7 +402,7 @@ def test_hybrid_reader_adapter_calls_backend(monkeypatch) -> None:
 
     def fake_post(url: str, json: dict):
         calls.append((url, json))
-        return FakeResp(200, {"choices": [{"message": {"content": "- live in Novi Sad\n- uses pnpm"}}]})
+        return FakeResp(200, {"choices": [{"message": {"content": "- live in Lisbon\n- uses pnpm"}}]})
 
     monkeypatch.setattr(adapter.client, "get", fake_get)
     monkeypatch.setattr(adapter.client, "post", fake_post)
@@ -411,9 +411,9 @@ def test_hybrid_reader_adapter_calls_backend(monkeypatch) -> None:
         state=None,
         query_embed=np.zeros(2560, dtype=np.float32),
         prev_summary="",
-        folded_entries=[("h1", "user", "I live in Novi Sad and use pnpm.")],
+        folded_entries=[("h1", "user", "I live in Lisbon and use pnpm.")],
     )
-    assert "Novi Sad" in out
+    assert "Lisbon" in out
     assert calls[0][0] == "/models"
     assert calls[1][0] == "/chat/completions"
     assert calls[1][1]["model"] == "inkling-2-mini"
@@ -561,7 +561,7 @@ def test_anthropic_messages_endpoint_and_direct_reader(tmp_path, monkeypatch) ->
                         "id": "msg_1",
                         "type": "message",
                         "role": "assistant",
-                        "content": [{"type": "text", "text": "Novi Sad"}],
+                        "content": [{"type": "text", "text": "Lisbon"}],
                     }
 
             return R()
@@ -582,8 +582,8 @@ def test_anthropic_messages_endpoint_and_direct_reader(tmp_path, monkeypatch) ->
     )
     c = TestClient(app)
     msgs = [
-        {"role": "user", "content": "I live in Novi Sad and use pnpm. " + ("x" * 240)},
-        {"role": "assistant", "content": "Noted: Novi Sad and pnpm. " + ("z" * 240)},
+        {"role": "user", "content": "I live in Lisbon and use pnpm. " + ("x" * 240)},
+        {"role": "assistant", "content": "Noted: Lisbon and pnpm. " + ("z" * 240)},
         {
             "role": "assistant",
             "content": [{"type": "tool_use", "id": "tu_1", "name": "note", "input": {"k": "v"}}],
@@ -701,7 +701,7 @@ def test_chunk_store_int8_quantization_ring_cap_and_legacy_float32(tmp_path) -> 
     assert hits_legacy[0]["score"] > 0.9
 
     # 3) Add 3 new int8 rows -> total would be 4, so oldest (legacy) is evicted by FIFO cap=3
-    texts = ["city Novi Sad", "package manager pnpm", "token FALCON-739"]
+    texts = ["city Lisbon", "package manager pnpm", "token FALCON-739"]
     vecs = _hash_embed(texts)
     store.add(2, [(f"h{i}", "user", t) for i, t in enumerate(texts)], vecs)
     assert store.count() == 3
@@ -782,8 +782,8 @@ def test_byok_client_auth_forwarded_to_hybrid_fold_summary(tmp_path, monkeypatch
     )
     c = TestClient(app)
     msgs = [
-        msg("user", "Remember city Novi Sad and pnpm. " + ("x" * 240)),
-        msg("assistant", "Stored Novi Sad and pnpm. " + ("y" * 240)),
+        msg("user", "Remember city Lisbon and pnpm. " + ("x" * 240)),
+        msg("assistant", "Stored Lisbon and pnpm. " + ("y" * 240)),
         msg("user", "What did I say?"),
     ]
     r = c.post(
@@ -798,6 +798,56 @@ def test_byok_client_auth_forwarded_to_hybrid_fold_summary(tmp_path, monkeypatch
 
     st = c.get("/v1/memochain/status", params={"session_id": "byok-1"}).json()
     assert "- BYOK summary ok" in st["summary"]
+
+
+def test_shared_volume_sync_from_disk_across_two_managers(tmp_path) -> None:
+    """Two proxy instances sharing store_root stay in sync when a session switches from :9000 to :9001."""
+    from memochain.server.app import SessionManager
+
+    root = tmp_path / "shared_sessions"
+    mgr_local = SessionManager(
+        root,
+        writer=FakeWriter(),
+        embed_fn=_hash_embed,
+        reader=EchoReader(),
+        hot_limit=120,
+        keep_min=40,
+        recall_top_k=2,
+    )
+    mgr_cloud = SessionManager(
+        root,
+        writer=FakeWriter(),
+        embed_fn=_hash_embed,
+        reader=EchoReader(),
+        hot_limit=120,
+        keep_min=40,
+        recall_top_k=2,
+    )
+
+    # Both managers open the same session before any fold
+    s_cloud = mgr_cloud.get("shared-1", [msg("user", "hi")])
+    assert s_cloud.summary == ""
+
+    # Local proxy folds early turns and writes meta.json + capsule.bin + chunks.db
+    s_local = mgr_local.get("shared-1", [msg("user", "hi")])
+    conv = [
+        msg("user", "Secret token ALPHA-99 and city Lisbon. " + ("x" * 240)),
+        msg("assistant", "Stored ALPHA-99 and Lisbon. " + ("y" * 240)),
+        msg("user", "Continue with cloud model"),
+    ]
+    _, stats_local = s_local.process(conv)
+    assert stats_local["fold"] is not None
+    assert s_local.head is not None
+
+    # Cloud proxy gets the next turn on the SAME session id -> reloads fresh state from disk
+    s_cloud_again = mgr_cloud.get("shared-1", conv)
+    assert s_cloud_again.head is not None
+    assert s_cloud_again.head.step == s_local.head.step
+    assert s_cloud_again.summary == s_local.summary
+    out_cloud, stats_cloud = s_cloud_again.process(conv + [msg("user", "What is ALPHA-99?")])
+    assert stats_cloud["fold"] is None  # already folded by local proxy, not re-folded
+    assert stats_cloud["recalled_chunks"] >= 1
+    assert "ALPHA-99" in out_cloud[0]["content"]
 
 
 

@@ -803,3 +803,70 @@ Findings:
    ~83% of its reader slot energy through the state (240.9 vs 29.2),
    while the e2e models route more through the question bypass. Full
    decomposition remains future work.
+
+## Phase 18: slim container packaging and reader usability audit (done)
+
+Live footprint and deployment overhaul of the proxy (`Dockerfile`,
+`docker-compose.yml`, `src/memochain/server/`):
+
+- Pure-NumPy container (`python:3.12-slim`, 235 MB image, ~51-57 MB RSS in
+  `docker stats`, 0 extra GPU VRAM, ~2 s startup). Optional `WITH_READER=1`
+  build arg installs CPU torch + transformers for `TransformersReaderAdapter`
+  (`--reader-backend transformers`).
+- All CLI flags accept `MEMOCHAIN_*` environment variable defaults; added
+  `python -m memochain.server` (`__main__.py`).
+- Honest live finding: against arbitrary out-of-distribution live chats,
+  the 16-token neural reader frequently decodes training-distribution priors
+  rather than exact live entities (ports, hashes, arbitrary identifiers),
+  while requiring an extra ~18 GB reader LM. The fold -> capsule -> SHA-256
+  receipt pipeline works cleanly in pure NumPy.
+
+## Phase 19: reader-free hybrid recall as default (done)
+
+Added `HybridReaderAdapter` (`--reader-backend hybrid`, now the default)
+and per-session SQLite `ChunkStore` in `src/memochain/server/session.py`:
+
+- On each fold (once per ~40k folded tokens at the 80k/40k window), one
+  short call to the active chat backend updates a rolling bullet fact sheet.
+- Folded chunks are indexed in per-session SQLite `chunks.db` and retrieved
+  on user queries with 0.65 cosine + 0.35 lexical overlap (`--recall-top-k 4`).
+- Live 4-entity recall probe (city, package manager, secret code, host:port)
+  after folding out early turns: hybrid recall answered 4/4 exact entities
+  vs 0/4 with the deterministic capsule profile digest alone, while keeping
+  the exact 22,606 B Q14 capsule and SHA-256 receipt chain intact on every
+  fold.
+
+## Phase 20: multi-backend coverage, BYOK, int8 chunks, and shared sessions (done)
+
+- Added native `POST /v1/messages` (non-streaming + SSE) with Anthropic
+  system-block merging and atomic `tool_use`/`tool_result` eviction groups
+  alongside OpenAI `/v1/chat/completions`, covering local servers (vLLM,
+  llama.cpp, Ollama), OpenRouter, and direct Anthropic.
+- Client BYOK headers (`Authorization`, `x-api-key`, `anthropic-workspace-id`,
+  `anthropic-version`, `anthropic-beta`) pass through verbatim for both chat
+  requests and hybrid fold-summary calls; `MEMOCHAIN_BACKEND_API_KEY` is an
+  optional server-side fallback only.
+- `ChunkStore` vectors quantized to int8 (2,560 B vs 10,240 B per row,
+  auto-migrating legacy float32 rows) with a FIFO `--max-chunks` ring cap
+  (default 2,000 chunks, ~7 MB max/session).
+- Cross-container session continuity: `SessionMemory.sync_from_disk()`
+  checks `meta.json` `mtime_ns` so dual proxies (`:9000` local + `:9001`
+  OpenRouter in `docker-compose.yml`) sharing one `/data` volume reload
+  state folded by the other container for the same `x-session-id`.
+
+## Phase 21: measured token-savings benchmark and paper alignment (done)
+
+- Added `tools/benchmark_savings.py`: replays an identical growing
+  conversation against direct and proxied endpoints and logs the backend's
+  own `usage.prompt_tokens`, `usage.cost` (when reported), and wall-clock
+  TTFT per turn.
+- 120-turn measured run (~1,200 tokens/turn, 8k test hot window, 38 folds)
+  against a local vLLM backend (`tools/bench_results/savings_report.md`):
+  7,086,360 input tokens direct vs 674,016 through the proxy (**90%
+  reduction**; final-turn prompt 117,125 -> 6,746 tokens).
+- Aligned `paper/main.tex`, `PAPER.md`, `README.md`, `BLOG.md`, and
+  `docs/index.html` with Phases 18-21, including an explicit Honesty Audit
+  item documenting that hybrid SQLite/fact-sheet recall sits outside the
+  22 KB capsule's receipt/ZK circuit. Suite: 76 Python tests (with torch;
+  54 collected on CPU-only hosts without torch) + 14 Rust tests.
+
