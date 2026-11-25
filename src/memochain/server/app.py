@@ -390,14 +390,16 @@ class HybridReaderAdapter:
         self._model_id: str | None = reader_model
         self._prefer_messages = "api.anthropic.com" in backend_base_url
 
-    def _pick_model(self, model_hint: str | None = None) -> str | None:
+    def _pick_model(
+        self, model_hint: str | None = None, auth_headers: dict[str, str] | None = None
+    ) -> str | None:
         if self._model_id:
             return self._model_id
         if model_hint:
             self._model_id = model_hint
             return self._model_id
         try:
-            r = self.client.get("/models")
+            r = self.client.get("/models", headers=auth_headers) if auth_headers else self.client.get("/models")
             if r.status_code == 200:
                 ids = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
                 if ids:
@@ -416,10 +418,11 @@ class HybridReaderAdapter:
         prev_summary: str,
         folded_entries: list[tuple[str, str, str]],
         model_hint: str | None = None,
+        auth_headers: dict[str, str] | None = None,
     ) -> str:
         if not folded_entries:
             return prev_summary
-        model = self._pick_model(model_hint=model_hint)
+        model = self._pick_model(model_hint=model_hint, auth_headers=auth_headers)
         if not model:
             return _profile_digest(state, query_embed, prev_summary)
 
@@ -434,16 +437,18 @@ class HybridReaderAdapter:
         )
         try:
             if self._prefer_messages:
-                text = self._call_messages(model, prompt)
+                text = self._call_messages(model, prompt, auth_headers=auth_headers)
             else:
-                text = self._call_chat_completions(model, prompt)
+                text = self._call_chat_completions(model, prompt, auth_headers=auth_headers)
             if text:
                 return text
         except Exception:
             pass
         return prev_summary or _profile_digest(state, query_embed, prev_summary)
 
-    def _call_chat_completions(self, model: str, prompt: str) -> str:
+    def _call_chat_completions(
+        self, model: str, prompt: str, auth_headers: dict[str, str] | None = None
+    ) -> str:
         payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -451,15 +456,24 @@ class HybridReaderAdapter:
         }
         if "api.anthropic.com" not in self.backend_base_url:
             payload["temperature"] = 0.0
-        resp = self.client.post("/chat/completions", json=payload)
+        resp = (
+            self.client.post("/chat/completions", json=payload, headers=auth_headers)
+            if auth_headers
+            else self.client.post("/chat/completions", json=payload)
+        )
         resp.raise_for_status()
         msg = resp.json()["choices"][0]["message"]
         return (msg.get("content") or "").strip()
 
-    def _call_messages(self, model: str, prompt: str) -> str:
+    def _call_messages(
+        self, model: str, prompt: str, auth_headers: dict[str, str] | None = None
+    ) -> str:
+        hdrs = {"anthropic-version": "2023-06-01"}
+        if auth_headers:
+            hdrs.update(auth_headers)
         resp = self.client.post(
             "/messages",
-            headers={"anthropic-version": "2023-06-01"},
+            headers=hdrs,
             json={
                 "model": model,
                 "max_tokens": 1536,
@@ -686,11 +700,13 @@ def create_app(
         if backend_ids and requested not in backend_ids:
             body["model"] = backend_ids[0]
 
-        rewritten, stats = mem.process(messages, model_hint=body.get("model"))
+        req_headers = _forward_auth_headers(request, backend_base_url)
+        rewritten, stats = mem.process(
+            messages, model_hint=body.get("model"), auth_headers=req_headers
+        )
         out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
         out_body["messages"] = rewritten
         stream = bool(out_body.get("stream"))
-        req_headers = _forward_auth_headers(request, backend_base_url)
 
         if not stream:
             resp = await client.post("/chat/completions", json=out_body, headers=req_headers)
@@ -750,8 +766,12 @@ def create_app(
         if backend_ids and requested not in backend_ids:
             body["model"] = backend_ids[0]
 
+        req_headers = _forward_anthropic_headers(request, backend_base_url)
         rewritten, stats = mem.process(
-            messages, model_hint=body.get("model"), inject_memory=False
+            messages,
+            model_hint=body.get("model"),
+            inject_memory=False,
+            auth_headers=req_headers,
         )
         out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
         out_body["messages"] = rewritten
@@ -759,7 +779,6 @@ def create_app(
         if memory_block:
             out_body["system"] = _merge_anthropic_system(out_body.get("system"), memory_block)
 
-        req_headers = _forward_anthropic_headers(request, backend_base_url)
         stream = bool(out_body.get("stream"))
 
         if not stream:

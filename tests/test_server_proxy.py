@@ -721,4 +721,83 @@ def test_chunk_store_int8_quantization_ring_cap_and_legacy_float32(tmp_path) -> 
     assert top[0]["score"] > 0.95
 
 
+def test_byok_client_auth_forwarded_to_hybrid_fold_summary(tmp_path, monkeypatch) -> None:
+    """BYOK client API key authenticates HybridReaderAdapter fold summaries even when proxy has no server key."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from memochain.server import app as app_mod
+
+    reader = app_mod.HybridReaderAdapter("https://openrouter.ai/api/v1", backend_api_key=None)
+    summary_posts: list[dict] = []
+
+    def fake_reader_post(url: str, json: dict, headers: dict | None = None):
+        summary_posts.append({"url": url, "json": json, "headers": headers or {}})
+
+        class R:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": "- BYOK summary ok"}}]}
+
+        return R()
+
+    monkeypatch.setattr(reader.client, "post", fake_reader_post)
+
+    class FakeOpenRouterBackend:
+        async def get(self, url: str):
+            class R:
+                status_code = 404
+
+            return R()
+
+        async def post(self, url: str, json=None, headers=None):
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "id": "chatcmpl-byok",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    }
+
+            return R()
+
+    app = app_mod.create_app(
+        backend_base_url="https://openrouter.ai/api/v1",
+        backend_api_key=None,
+        checkpoint="unused",
+        store_root=tmp_path / "byok_sessions",
+        embedding_base_url=None,
+        writer=FakeWriter(),
+        reader=reader,
+        embed_fn=_hash_embed,
+        backend_client=FakeOpenRouterBackend(),
+        hot_limit=120,
+        keep_min=40,
+        recall_top_k=2,
+    )
+    c = TestClient(app)
+    msgs = [
+        msg("user", "Remember city Novi Sad and pnpm. " + ("x" * 240)),
+        msg("assistant", "Stored Novi Sad and pnpm. " + ("y" * 240)),
+        msg("user", "What did I say?"),
+    ]
+    r = c.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer sk-or-client-byok", "x-session-id": "byok-1"},
+        json={"model": "anthropic/claude-sonnet-4", "messages": msgs},
+    )
+    assert r.status_code == 200
+    assert len(summary_posts) == 1
+    assert summary_posts[0]["headers"]["Authorization"] == "Bearer sk-or-client-byok"
+    assert summary_posts[0]["json"]["model"] == "anthropic/claude-sonnet-4"
+
+    st = c.get("/v1/memochain/status", params={"session_id": "byok-1"}).json()
+    assert "- BYOK summary ok" in st["summary"]
+
+
 

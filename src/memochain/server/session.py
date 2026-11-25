@@ -389,7 +389,12 @@ class SessionMemory:
 
     # ---- memory operations ----------------------------------------------
 
-    def _fold_messages(self, msgs: list[dict[str, Any]], model_hint: str | None = None) -> FoldStats:
+    def _fold_messages(
+        self,
+        msgs: list[dict[str, Any]],
+        model_hint: str | None = None,
+        auth_headers: dict[str, str] | None = None,
+    ) -> FoldStats:
         entries: list[tuple[str, str, str]] = []
         texts: list[str] = []
         for m in msgs:
@@ -431,10 +436,20 @@ class SessionMemory:
         if hasattr(self.reader, "read_fold"):
             try:
                 self.summary = self.reader.read_fold(
-                    state, q / norm, self.summary, entries, model_hint=model_hint
+                    state,
+                    q / norm,
+                    self.summary,
+                    entries,
+                    model_hint=model_hint,
+                    auth_headers=auth_headers,
                 )
             except TypeError:
-                self.summary = self.reader.read_fold(state, q / norm, self.summary, entries)
+                try:
+                    self.summary = self.reader.read_fold(
+                        state, q / norm, self.summary, entries, model_hint=model_hint
+                    )
+                except TypeError:
+                    self.summary = self.reader.read_fold(state, q / norm, self.summary, entries)
         else:
             self.summary = self.reader.read(state, q / norm, self.summary)
         self._save()
@@ -451,6 +466,7 @@ class SessionMemory:
         messages: list[dict[str, Any]],
         model_hint: str | None = None,
         inject_memory: bool = True,
+        auth_headers: dict[str, str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Fold overflow and return (rewritten_messages, stats).
 
@@ -517,7 +533,9 @@ class SessionMemory:
                 evict_end = end
             if evict_end > 0:
                 to_fold = hot[:evict_end]
-                fold_stats = self._fold_messages(to_fold, model_hint=model_hint)
+                fold_stats = self._fold_messages(
+                    to_fold, model_hint=model_hint, auth_headers=auth_headers
+                )
                 for m in to_fold:
                     h = message_hash(m)
                     self.folded_hashes.append(h)
