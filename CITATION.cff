@@ -13,10 +13,26 @@ doi: 10.5281/zenodo.24497714
 identifiers:
   - type: doi
     value: 10.5281/zenodo.24497714
-    description: Version 0.1.0 archive on Zenodo
+    description: Version 0.1.0 software archive on Zenodo
   - type: doi
     value: 10.5281/zenodo.24497713
-    description: Concept DOI (all versions on Zenodo)
+    description: Software Concept DOI (all versions on Zenodo)
+  - type: doi
+    value: 10.5281/zenodo.24545515
+    description: Preprint paper v1 on Zenodo
+  - type: doi
+    value: 10.5281/zenodo.24545514
+    description: Preprint paper Concept DOI (all versions on Zenodo)
+preferred-citation:
+  type: article
+  title: "MemoChain: Verifiable Constant-Size Memory for Language Models"
+  authors:
+    - given-names: Branislav
+      family-names: Đalić
+  year: 2026
+  month: 11
+  doi: 10.5281/zenodo.24545515
+  url: "https://zenodo.org/record/24545515"
 license: Apache-2.0
 repository-code: "https://github.com/Omodaka9375/memochain"
 url: "https://omodaka9375.github.io/memochain/"
