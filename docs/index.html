@@ -418,7 +418,6 @@
         <a href="#capsule">Capsule</a>
         <a href="#proof">Proof</a>
         <a href="#results">Results</a>
-        <a href="#position">Position</a>
         <a href="#start">Start</a>
       </span>
       <span class="topbar-right">
@@ -509,10 +508,10 @@
             <tr><td>domains</td><td><b>Domain transfer.</b> Trained on a real developer's 241 coding sessions: coding recall doubles, 96.6% of the QA gain stays.</td></tr>
 
             <tr class="group"><td colspan="2">The deployment</td></tr>
-            <tr><td>proxy</td><td><b>OpenAI-compatible.</b> Drop-in memory layer in front of any chat backend; sessions start empty, folds happen live.</td></tr>
-            <tr><td>sidecars</td><td><b>Torch-free production host.</b> Q14 writer loads from numpy, embeddings and memory notes come from sidecars.</td></tr>
-            <tr><td>audit</td><td><b>Background proofs.</b> The proxy's proof queue replays each fold in the zkVM and checks the capsule against its receipts.</td></tr>
-            <tr><td>tests</td><td><b>67 Python + 14 Rust tests.</b> Core runs on a laptop CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
+            <tr><td>proxy</td><td><b>OpenAI + Anthropic APIs.</b> Drop-in proxy on <code>/v1/chat/completions</code> and native <code>/v1/messages</code> (Claude Code, OpenRouter, direct Anthropic, vLLM, llama.cpp, Ollama).</td></tr>
+            <tr><td>container</td><td><b>Single slim container.</b> ~52 MB RAM, 0 extra GPU, 235 MB image, 2-second boot. Default hybrid mode pairs the 22 KB Q14 capsule with a rolling fact sheet and int8 SQLite chunk recall (capped at 2,000 chunks).</td></tr>
+            <tr><td>audit</td><td><b>Background proofs.</b> The proxy's proof queue replays each fold in the zkVM and verifies the capsule against its SHA-256 receipt chain via <code>/v1/memochain/verify</code>.</td></tr>
+            <tr><td>tests</td><td><b>74 Python + 14 Rust tests.</b> Core and proxy run on any CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
           </tbody>
         </table>
       </div>
@@ -571,7 +570,7 @@
             <tr><td>verify</td><td><b>~28 ms anywhere.</b> No history access, no weights, no GPU. A light client checks three fields in O(1).</td></tr>
             <tr><td>freivalds</td><td><b>Exact inner products.</b> Batches larger than 4 documents are checked inside the guest with 2-round exact i128 Fiat–Shamir Freivalds (soundness ≤ 2⁻¹²⁸).</td></tr>
             <tr><td>four-way</td><td><b>Bit-exact agreement.</b> Python = native Rust = zkVM execute = zkVM proof, on real unseen sessions.</td></tr>
-            <tr><td>does not</td><td><b>Honest scope.</b> Does not prove the embedding model ran honestly, and does not constrain the downstream decoder.</td></tr>
+            <tr><td>does not</td><td><b>Honest scope.</b> Does not prove the embedding model ran honestly, does not constrain the downstream decoder, and in default hybrid proxy mode the SQLite chunk store and LLM fact sheet sit outside the ZK circuit.</td></tr>
           </tbody>
         </table>
       </div>
@@ -620,22 +619,44 @@
         </div>
         <h2>Run it in four commands.</h2>
         <p class="lead">
-          Core + 67 tests on a laptop CPU; training on a single 12 GB GPU;
-          proofs on Linux/ARM; the proxy on any host with an OpenAI backend.
+          Core + 74 tests on a laptop CPU; single-container hybrid proxy in
+          52 MB RAM for local models, OpenRouter, or Claude; training on a
+          single 12 GB GPU; proofs on Linux/ARM.
         </p>
         <div class="os-tabs" role="tablist" id="osTabs">
-          <button class="os-tab" role="tab" data-os="core" aria-selected="true">Core</button>
+          <button class="os-tab" role="tab" data-os="proxy" aria-selected="true">Proxy</button>
+          <button class="os-tab" role="tab" data-os="core">Core</button>
           <button class="os-tab" role="tab" data-os="train">Train</button>
-          <button class="os-tab" role="tab" data-os="proxy">Proxy</button>
           <button class="os-tab" role="tab" data-os="prove">Prove</button>
         </div>
-        <div class="os-panel active" data-os="core">
+        <div class="os-panel active" data-os="proxy">
+          <div class="os-card">
+            <h4>Single-container memory proxy (hybrid default)</h4>
+            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet.</p>
+            <div class="codebox">
+            <pre># Docker (recommended: 235 MB image, ~52 MB RAM, 0 extra GPU)
+docker compose up -d
+
+# Or directly via Python
+uv sync --extra proxy
+PYTHONPATH=src python -m memochain.server \
+    --backend-base-url http://localhost:8000/v1 --port 9000</pre>
+            <button class="copy" type="button" aria-label="Copy commands">Copy</button>
+            </div>
+            <div class="os-meta">
+              <span>Endpoints <b>/v1/chat/completions · /v1/messages · /v1/memochain/verify</b></span>
+              <span>Footprint <b>~52 MB RAM · 0 GPU</b></span>
+              <span>Hot window <b>80k / 40k tokens</b></span>
+            </div>
+          </div>
+        </div>
+        <div class="os-panel" data-os="core">
           <div class="os-card">
             <h4>Core + tests (pure numpy, any CPU)</h4>
             <p>Fold, read, verify, tamper-check, benchmark. No torch, no GPU, no downloads.</p>
             <div class="codebox">
             <pre>uv sync --extra dev
-uv run pytest          # 67 tests
+uv run pytest          # 74 tests (torch tests skip if absent)
 uv run demo.py</pre>
             <button class="copy" type="button" aria-label="Copy commands">Copy</button>
             </div>
@@ -660,23 +681,6 @@ PYTHONPATH=src python -m memochain.train_e2e \
               <span>Requires <b>12 GB GPU · torch</b></span>
               <span>Runtime <b>~18 min</b></span>
               <span>Exports <b>weights.bin · reader.npz</b></span>
-            </div>
-          </div>
-        </div>
-        <div class="os-panel" data-os="proxy">
-          <div class="os-card">
-            <h4>Live memory proxy (OpenAI-compatible)</h4>
-            <p>Drop-in layer in front of any chat backend. Sessions start empty; folds happen past 80k conversation tokens.</p>
-            <div class="codebox">
-            <pre>uv sync --extra proxy
-PYTHONPATH=src python -m memochain.server.app \
-    --backend-base-url http://localhost:8000/v1 \
-    --checkpoint runs/e2e_pv4 --port 9000</pre>
-            <button class="copy" type="button" aria-label="Copy commands">Copy</button>
-            </div>
-            <div class="os-meta">
-              <span>Endpoints <b>/v1/chat/completions · /v1/memochain/verify</b></span>
-              <span>Hot window <b>80k / 40k tokens</b></span>
             </div>
           </div>
         </div>

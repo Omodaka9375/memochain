@@ -16,6 +16,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,17 +37,58 @@ def estimate_tokens(text: str) -> int:
 
 
 def message_text(msg: dict[str, Any]) -> str:
-    """Extract comparable text from one chat message (text parts joined)."""
+    """Extract comparable text from one chat message (OpenAI + Anthropic blocks)."""
     content = msg.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
+        parts: list[str] = []
         for block in content:
-            if isinstance(block, dict) and isinstance(block.get("text"), str):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if isinstance(block.get("text"), str):
                 parts.append(block["text"])
+            elif btype == "tool_use":
+                name = block.get("name") or "tool"
+                inp = block.get("input")
+                parts.append(
+                    f"[tool_use {name}: {json.dumps(inp, sort_keys=True, default=str)}]"
+                    if inp is not None
+                    else f"[tool_use {name}]"
+                )
+            elif btype == "tool_result":
+                inner = block.get("content")
+                if isinstance(inner, str):
+                    parts.append(inner)
+                elif isinstance(inner, list):
+                    for sub in inner:
+                        if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                            parts.append(sub["text"])
         return "\n".join(parts)
     return ""
+
+
+def _anthropic_tool_use_ids(msg: dict[str, Any]) -> set[str]:
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(b["id"])
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+    }
+
+
+def _anthropic_tool_result_ids(msg: dict[str, Any]) -> set[str]:
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(b["tool_use_id"])
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
+    }
 
 
 def message_hash(msg: dict[str, Any]) -> str:
@@ -67,9 +110,10 @@ def message_hash(msg: dict[str, Any]) -> str:
 def eviction_groups(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
     """Group message indices into atomic eviction units.
 
-    An assistant message with ``tool_calls`` groups together with every
-    following ``tool`` message that answers one of its call ids, so a tool
-    result can never be evicted without its request (or vice versa).
+    An assistant message carrying OpenAI ``tool_calls`` or Anthropic
+    ``tool_use`` blocks groups together with the following ``tool`` /
+    ``tool_result`` message(s) that answer it, so tool calls and results
+    can never be split across a fold boundary.
     """
     groups: list[tuple[int, int]] = []
     i, n = 0, len(messages)
@@ -79,6 +123,12 @@ def eviction_groups(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
             j = i + 1
             call_ids = {tc.get("id") for tc in m["tool_calls"] if isinstance(tc, dict)}
             while j < n and messages[j].get("role") == "tool" and messages[j].get("tool_call_id") in call_ids:
+                j += 1
+            groups.append((i, j))
+            i = j
+        elif m.get("role") == "assistant" and (use_ids := _anthropic_tool_use_ids(m)):
+            j = i + 1
+            if j < n and messages[j].get("role") == "user" and (_anthropic_tool_result_ids(messages[j]) & use_ids):
                 j += 1
             groups.append((i, j))
             i = j
@@ -107,6 +157,127 @@ class MemoryReader(Protocol):
     def read(self, state: MemoryState, query_embed: "np.ndarray", prev_summary: str) -> str: ...
 
 
+class ChunkStore:
+    """SQLite-backed verbatim chunk store + vector/lexical hybrid search (Option B).
+
+    Each folded message is saved with its role, text, message hash, and a
+    per-vector int8-quantized unit embedding (4x smaller than float32, with
+    transparent fallback when reading legacy float32 rows). Optional
+    ``max_chunks`` caps table size via FIFO eviction so disk and scan cost
+    stay bounded per session.
+    """
+
+    def __init__(self, db_path: str | Path, max_chunks: int = 2000) -> None:
+        self.db_path = Path(db_path)
+        self.max_chunks = max(0, int(max_chunks))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    step INTEGER NOT NULL,
+                    msg_hash TEXT UNIQUE NOT NULL,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    vec BLOB NOT NULL,
+                    scale REAL NOT NULL DEFAULT 0.0
+                )
+                """
+            )
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "scale" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN scale REAL NOT NULL DEFAULT 0.0")
+
+    @staticmethod
+    def _quantize_i8(unit_vec: "np.ndarray") -> tuple[bytes, float]:
+        max_abs = float(np.max(np.abs(unit_vec)))
+        if max_abs <= 0.0:
+            return np.zeros(unit_vec.shape, dtype=np.int8).tobytes(), 0.0
+        scale = max_abs / 127.0
+        q = np.clip(np.round(unit_vec / scale), -127, 127).astype(np.int8)
+        return q.tobytes(), scale
+
+    @staticmethod
+    def _dequantize(blob: bytes, dim: int, scale: float) -> "np.ndarray | None":
+        if len(blob) == dim:  # int8 quantized
+            if scale <= 0.0:
+                return np.zeros(dim, dtype=np.float32)
+            return np.frombuffer(blob, dtype=np.int8).astype(np.float32) * float(scale)
+        if len(blob) == dim * 4:  # legacy float32 row
+            return np.frombuffer(blob, dtype="<f4")
+        return None
+
+    def add(self, step: int, entries: list[tuple[str, str, str]], embeds: "np.ndarray") -> None:
+        """Store (msg_hash, role, text) rows aligned with embeds [N, D]."""
+        arr = np.asarray(embeds, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        arr = arr / norms
+        with sqlite3.connect(self.db_path) as conn:
+            for i, (mhash, role, text) in enumerate(entries):
+                blob, scale = self._quantize_i8(arr[i])
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunks (step, msg_hash, role, text, dim, vec, scale) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (step, mhash, role, text, int(arr.shape[1]), blob, scale),
+                )
+            if self.max_chunks > 0:
+                conn.execute(
+                    "DELETE FROM chunks WHERE id NOT IN (SELECT id FROM chunks ORDER BY id DESC LIMIT ?)",
+                    (self.max_chunks,),
+                )
+
+    def count(self) -> int:
+        if not self.db_path.exists():
+            return 0
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+            return int(row[0]) if row else 0
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9_./:-]{2,}", text.lower()))
+
+    def search(self, query_text: str, query_embed: "np.ndarray", top_k: int = 4) -> list[dict[str, Any]]:
+        if top_k <= 0 or not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT step, role, text, dim, vec, scale FROM chunks ORDER BY id ASC"
+            ).fetchall()
+        if not rows:
+            return []
+        q = np.asarray(query_embed, dtype=np.float32).reshape(-1)
+        q_norm = float(np.linalg.norm(q))
+        if q_norm > 0:
+            q = q / q_norm
+        q_toks = self._tokens(query_text)
+
+        scored: list[tuple[float, int, str, str]] = []
+        for step, role, text, dim, blob, scale in rows:
+            cos = 0.0
+            if dim == q.size:
+                v = self._dequantize(blob, dim, float(scale or 0.0))
+                if v is not None:
+                    cos = float(np.dot(q, v))
+            lex = 0.0
+            if q_toks:
+                c_toks = self._tokens(text)
+                if c_toks:
+                    lex = len(q_toks & c_toks) / max(1, len(q_toks))
+            score = 0.65 * cos + 0.35 * lex
+            scored.append((score, int(step), str(role), str(text)))
+
+        scored.sort(key=lambda r: r[0], reverse=True)
+        return [
+            {"score": round(score, 4), "step": step, "role": role, "text": text}
+            for score, step, role, text in scored[:top_k]
+        ]
+
+
 @dataclass
 class FoldStats:
     folded_messages: int
@@ -130,6 +301,8 @@ class SessionMemory:
         keep_min: int = 40000,
         max_doc_chars: int = 2000,
         proof_queue: Any | None = None,
+        recall_top_k: int = 0,
+        max_chunks: int = 2000,
     ) -> None:
         self.session_id = session_id
         self.dir = Path(store_dir)
@@ -141,6 +314,11 @@ class SessionMemory:
         self.keep_min = keep_min
         self.max_doc_chars = max_doc_chars
         self.proof_queue = proof_queue
+        self.recall_top_k = recall_top_k
+        self.max_chunks = max_chunks
+        self.chunk_store = (
+            ChunkStore(self.dir / "chunks.db", max_chunks=max_chunks) if recall_top_k > 0 else None
+        )
 
         self.folded_hashes: list[str] = []
         self._folded_set: set[str] = set()
@@ -211,12 +389,15 @@ class SessionMemory:
 
     # ---- memory operations ----------------------------------------------
 
-    def _fold_messages(self, msgs: list[dict[str, Any]]) -> FoldStats:
-        texts = []
+    def _fold_messages(self, msgs: list[dict[str, Any]], model_hint: str | None = None) -> FoldStats:
+        entries: list[tuple[str, str, str]] = []
+        texts: list[str] = []
         for m in msgs:
             t = message_text(m).strip()
             if t:
-                texts.append(t[: self.max_doc_chars])
+                clipped = t[: self.max_doc_chars]
+                texts.append(clipped)
+                entries.append((message_hash(m), str(m.get("role") or "user"), clipped))
         if not texts:
             texts = ["(empty tool exchange)"]
 
@@ -229,6 +410,8 @@ class SessionMemory:
             q14, initial_state=self.state, initial_head=self.head
         )
         self.state, self.head = state, head
+        if self.chunk_store is not None and entries:
+            self.chunk_store.add(head.step, entries, docs_f[: len(entries)])
         if self.proof_queue is not None and q14.shape[1] == 2560:
             # raw Q14 little-endian i16 docs for the SP1 IVC queue
             self.proof_queue.submit(self.session_id, q14.tobytes())
@@ -245,7 +428,15 @@ class SessionMemory:
         # query embedding for the digest reader: normalized mean of folded docs
         q = docs_f.mean(axis=0)
         norm = float(np.linalg.norm(q)) or 1.0
-        self.summary = self.reader.read(state, q / norm, self.summary)
+        if hasattr(self.reader, "read_fold"):
+            try:
+                self.summary = self.reader.read_fold(
+                    state, q / norm, self.summary, entries, model_hint=model_hint
+                )
+            except TypeError:
+                self.summary = self.reader.read_fold(state, q / norm, self.summary, entries)
+        else:
+            self.summary = self.reader.read(state, q / norm, self.summary)
         self._save()
         return FoldStats(
             folded_messages=len(msgs),
@@ -255,7 +446,12 @@ class SessionMemory:
             capsule_bytes=len(raw),
         )
 
-    def process(self, messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def process(
+        self,
+        messages: list[dict[str, Any]],
+        model_hint: str | None = None,
+        inject_memory: bool = True,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Fold overflow and return (rewritten_messages, stats).
 
         Invariants preserved on the rewritten message list:
@@ -321,7 +517,7 @@ class SessionMemory:
                 evict_end = end
             if evict_end > 0:
                 to_fold = hot[:evict_end]
-                fold_stats = self._fold_messages(to_fold)
+                fold_stats = self._fold_messages(to_fold, model_hint=model_hint)
                 for m in to_fold:
                     h = message_hash(m)
                     self.folded_hashes.append(h)
@@ -337,22 +533,67 @@ class SessionMemory:
                 stats["hot_messages"] = len(sys_msgs) + len(hot)
                 stats["hot_tokens"] = sum(estimate_tokens(message_text(m)) for m in hot)
 
-        rewritten = self._inject_memory(list(sys_msgs) + list(hot))
+        recalled: list[dict[str, Any]] = []
+        if self.chunk_store is not None and self.chunk_store.count() > 0:
+            last_user_text = next(
+                (
+                    message_text(m).strip()
+                    for m in reversed(hot)
+                    if m.get("role") == "user" and message_text(m).strip()
+                ),
+                "",
+            )
+            if last_user_text:
+                q_vec = self.embed_fn([last_user_text])[0]
+                recalled = self.chunk_store.search(
+                    last_user_text, q_vec, top_k=self.recall_top_k
+                )
+                stats["recalled_chunks"] = len(recalled)
+
+        memory_block = self.format_memory_block(recalled=recalled)
+        if memory_block:
+            stats["memory_block"] = memory_block
+        rewritten = (
+            self._inject_memory(list(sys_msgs) + list(hot), memory_block=memory_block)
+            if inject_memory
+            else list(sys_msgs) + list(hot)
+        )
         return rewritten, stats
 
-    def _inject_memory(self, hot: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not self.summary:
+    def format_memory_block(self, recalled: list[dict[str, Any]] | None = None) -> str:
+        if not self.summary and not recalled:
+            return ""
+        sections: list[str] = [
+            "[Durable memory]",
+            "Compressed notes from earlier parts of this session (older than what you can see here):",
+        ]
+        if self.summary:
+            sections.append(self.summary)
+        if recalled:
+            sections.append("")
+            sections.append("Relevant verbatim turns recalled for the current question:")
+            for item in recalled:
+                snippet = item["text"].replace("\n", " ").strip()
+                if len(snippet) > 600:
+                    snippet = snippet[:600] + "..."
+                sections.append(f"- [{item['role']}] {snippet}")
+        return "\n".join(sections)
+
+    def _inject_memory(
+        self,
+        hot: list[dict[str, Any]],
+        recalled: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rendered = memory_block if memory_block is not None else self.format_memory_block(recalled=recalled)
+        if not rendered:
             return list(hot)
-        block = (
-            "\n\n[Durable memory]\n"
-            "Compressed notes from earlier parts of this session (older than "
-            "what you can see here):\n" + self.summary
-        )
+        block = "\n\n" + rendered
         out = [dict(m) for m in hot]
         if out and out[0].get("role") == "system":
             first = dict(out[0])
             c = first.get("content")
-            first["content"] = (c + block) if isinstance(c, str) else block
+            first["content"] = (c + block) if isinstance(c, str) else block.lstrip()
             out[0] = first
         else:
             out.insert(0, {"role": "system", "content": block.strip()})

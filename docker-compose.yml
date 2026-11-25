@@ -1,0 +1,60 @@
+# MemoChain memory proxy: one container in front of any OpenAI-compatible
+# model server. Point clients at :9000 and swap the backend freely.
+#
+#   docker compose up -d
+#   curl localhost:9000/v1/models
+#
+# Optional services / overrides:
+#  - embedding:  real Qwen3-Embedding-4B via vLLM (else offline hash-embed)
+#  - reader LM:  build with WITH_READER=1 and set MEMOCHAIN_READER_BACKEND=transformers
+
+services:
+  memochain:
+    build:
+      context: .
+      # add --build-arg WITH_READER=1 if you want --reader-backend transformers
+      args:
+        WITH_READER: "0"
+    image: memochain:latest
+    container_name: memochain
+    ports:
+      - "9000:9000"
+    environment:
+      # Pick one backend (default: local OpenAI-compatible server like Inkling/vLLM/llama.cpp/Ollama):
+      MEMOCHAIN_BACKEND_BASE_URL: http://host.docker.internal:8000/v1
+      # MEMOCHAIN_BACKEND_API_KEY: ""                                   # optional for local; required for OpenRouter/Anthropic
+
+      # Preset: OpenRouter (Claude, GPT, Gemini, Qwen, etc.)
+      # MEMOCHAIN_BACKEND_BASE_URL: https://openrouter.ai/api/v1
+      # MEMOCHAIN_BACKEND_API_KEY: sk-or-v1-...
+
+      # Preset: Direct Anthropic (Claude API + Claude Code /v1/messages)
+      # MEMOCHAIN_BACKEND_BASE_URL: https://api.anthropic.com/v1
+      # MEMOCHAIN_BACKEND_API_KEY: sk-ant-...
+
+      MEMOCHAIN_CHECKPOINT: /checkpoints/student                        # exported np_*.npy weights
+      MEMOCHAIN_STORE_ROOT: /data/sessions
+      MEMOCHAIN_READER_BACKEND: hybrid                                  # default: backend fact sheet + top-K chunk recall
+      # MEMOCHAIN_RECALL_TOP_K: "4"
+      # MEMOCHAIN_MAX_CHUNKS: "2000"                                    # ring-buffer cap on int8 SQLite chunks (~7 MB max/session)
+      # MEMOCHAIN_EMBEDDING_BASE_URL: http://embedding:8001/v1         # uncomment with the service below
+      # MEMOCHAIN_READER_BACKEND: transformers
+      # MEMOCHAIN_READER_DECODER: Qwen/Qwen3-0.6B
+      # MEMOCHAIN_READER_DEVICE: cpu
+      # MEMOCHAIN_HOT_LIMIT: "80000"
+      # MEMOCHAIN_KEEP_MIN: "40000"
+    volumes:
+      - ./checkpoints:/checkpoints:ro
+      - memochain-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # embedding:
+  #   image: vllm/vllm-openai:latest
+  #   command: --model Qwen/Qwen3-Embedding-4B --served-model-name bge --port 8001
+  #   ports: ["8001:8001"]
+  #   # then set MEMOCHAIN_EMBEDDING_BASE_URL: http://embedding:8001/v1 above
+
+volumes:
+  memochain-data:

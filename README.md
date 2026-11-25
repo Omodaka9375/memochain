@@ -94,23 +94,39 @@ the teacher's memory gain at 181.8x compression. See DESIGN.md Phase 10.
 
 ## Memory proxy (OpenAI-compatible)
 
+By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus per-session SQLite chunk retrieval alongside the exact 22 KB Q14 capsule and sha256 receipt chain.
+
 ```bash
+# Single Docker container (recommended, ~57 MB RAM, 0 extra GPU)
+docker compose up -d
+
+# Or directly via Python
 uv sync --extra proxy
-PYTHONPATH=src python -m memochain.server.app \
+PYTHONPATH=src python -m memochain.server \
     --backend-base-url http://localhost:8000/v1 \
     --checkpoint runs/e2e_qwen06b_pv4 \
-    --embedding-base-url http://embed-sidecar:8001/v1 \
-    --reader-sidecar-url http://reader-sidecar:8002 \
-    --proof-mode execute --port 9000
+    --port 9000
 ```
 
-Point any OpenAI client at `http://localhost:9000/v1`. Sessions start with
-zero memory; once the conversation exceeds `--hot-limit` tokens (default
+Point any OpenAI client at `http://localhost:9000/v1` (or any Anthropic
+`/v1/messages` client such as Claude Code at `http://localhost:9000`).
+Supported backends via `MEMOCHAIN_BACKEND_BASE_URL` / `--backend-base-url`:
+
+- **Local OpenAI-compatible (default)**: vLLM (e.g. `http://localhost:8000/v1`),
+  llama.cpp server, Ollama (`http://localhost:11434/v1`), LM Studio.
+- **OpenRouter**: `https://openrouter.ai/api/v1` (with `MEMOCHAIN_BACKEND_API_KEY`
+  or client pass-through key).
+- **Direct Anthropic**: `https://api.anthropic.com/v1`.
+
+Sessions start with zero memory; once the conversation exceeds `--hot-limit` tokens (default
 80,000, conversation only) the oldest turns fold into the 22 KB capsule,
-memory notes are injected into the system prompt, and the SP1 queue replays
-the fold in the background (`/v1/memochain/verify` reports capsule, receipt
-chain, and proof status). The chat backend is swappable; the writer is
-torch-free in production.
+recalled facts + top-K verbatim chunks are injected into the system prompt,
+and the optional SP1 queue replays the fold in the background
+(`/v1/memochain/verify` reports capsule, receipt chain, and proof status).
+Optional flags: `--reader-backend transformers` (in-process neural reader),
+`--reader-backend profile` (numpy recall profile only), `--reader-sidecar-url`,
+`--embedding-base-url`, and `--proof-mode execute`. The chat backend is
+swappable; the writer is torch-free in production.
 
 ## ZK proofs (Linux / SP1)
 

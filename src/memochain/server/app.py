@@ -12,7 +12,8 @@ Run:
       --host 0.0.0.0 --port 9000
 
 Endpoints:
-  POST /v1/chat/completions   proxy with dynamic memory folding (+SSE stream)
+  POST /v1/chat/completions   OpenAI chat completions with memory folding (+SSE)
+  POST /v1/messages           Anthropic Messages API with memory folding (+SSE)
   GET  /v1/memochain/status   memory stats for a session
   GET  /v1/memochain/verify   receipt-chain + capsule integrity for a session
   GET  /healthz
@@ -275,6 +276,202 @@ class StudentReaderAdapter:
         return " ".join(parts)[: self.max_words * 8]
 
 
+class TransformersReaderAdapter:
+    """In-process reader: numpy read head + a small HF decoder, no vLLM.
+
+    Loads the decoder once with transformers; each fold decodes the 16 memory
+    tokens with greedy generate (a few seconds on GPU). Use with the joint or
+    pv4 e2e checkpoint whose reader.npz matches the decoder's hidden size.
+    """
+
+    def __init__(self, checkpoint: str | Path, decoder: str, device: str = "cuda", max_words: int = 160) -> None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from ..eval_qa import MEMORY_TOKEN
+        from ..reader_np import NumpyReader
+
+        path = Path(checkpoint)
+        self.reader = NumpyReader(
+            path / "reader.npz", np.load(path / "np_key_w.npy"), np.load(path / "np_key_b.npy")
+        )
+        import torch
+
+        self.torch = torch
+        self.device = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+        self.max_words = max_words
+        self.tokenizer = AutoTokenizer.from_pretrained(decoder)
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [MEMORY_TOKEN]})
+        self.memory_token_id = self.tokenizer.convert_tokens_to_ids(MEMORY_TOKEN)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(decoder, dtype=torch.bfloat16)
+        except TypeError:  # transformers < 5
+            self.model = AutoModelForCausalLM.from_pretrained(decoder, torch_dtype=torch.bfloat16)
+        self.model = self.model.to(self.device).eval()
+        self.embed = self.model.get_input_embeddings()
+
+    def read(self, state, query_embed, prev_summary: str) -> str:
+        from .reader_service import SUMMARY_QUESTION
+        from ..eval_qa import (
+            PERSONA_PROMPT,
+            build_memory_messages,
+            clean_generation,
+        )
+
+        torch = self.torch
+        t = self.reader.read_tokens(np.asarray(state.tokens), np.asarray(query_embed, dtype=np.float32))
+        question = SUMMARY_QUESTION.format(words=self.max_words)
+        messages = build_memory_messages(question, t.shape[0], system_prompt=PERSONA_PROMPT)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        positions = [i for i, tid in enumerate(ids) if tid == self.memory_token_id]
+        if len(positions) != t.shape[0]:
+            raise RuntimeError(f"expected {t.shape[0]} memory tokens in prompt, found {len(positions)}")
+        ids_t = torch.tensor([ids], dtype=torch.long, device=self.device)
+        base_embeds = self.embed(ids_t.clamp(max=self.embed.num_embeddings - 1)).clone()
+        mem = torch.from_numpy(t).to(device=base_embeds.device, dtype=base_embeds.dtype)
+        for row, pos in enumerate(positions):
+            base_embeds[0, pos] = mem[row]
+        with torch.inference_mode():
+            out = self.model.generate(
+                inputs_embeds=base_embeds, max_new_tokens=256, do_sample=False
+            )
+        text = clean_generation(self.tokenizer.decode(out[0], skip_special_tokens=True)).strip()
+        if text and text.lower() != "no salient memory":
+            return text
+        return prev_summary
+
+
+def _backend_auth_headers(backend_base_url: str, backend_api_key: str | None) -> dict[str, str]:
+    """Build auth headers for OpenAI-style, OpenRouter, or direct Anthropic backends."""
+    if not backend_api_key:
+        return {}
+    if "api.anthropic.com" in backend_base_url:
+        return {"x-api-key": backend_api_key, "Authorization": f"Bearer {backend_api_key}"}
+    return {"Authorization": f"Bearer {backend_api_key}"}
+
+
+def _merge_anthropic_system(system_field: Any, memory_block: str) -> Any:
+    """Append the memory block to Anthropic's top-level ``system`` (string or blocks)."""
+    if not memory_block:
+        return system_field
+    if system_field is None:
+        return memory_block
+    if isinstance(system_field, str):
+        return f"{system_field}\n\n{memory_block}" if system_field else memory_block
+    if isinstance(system_field, list):
+        return list(system_field) + [{"type": "text", "text": memory_block}]
+    return memory_block
+
+
+class HybridReaderAdapter:
+    """Reader-free Option A digest: asks the active backend model to update a
+    compact structured fact sheet from newly folded turns.
+
+    Runs inside the slim numpy-only container with zero extra GPU memory and
+    zero reader-model boot. Supports OpenAI ``/chat/completions`` and Anthropic
+    ``/messages`` backends (direct Anthropic API or OpenRouter). Falls back to
+    the deterministic profile digest if the backend call fails.
+    """
+
+    def __init__(
+        self,
+        backend_base_url: str,
+        backend_api_key: str | None = None,
+        max_words: int = 220,
+        timeout: float = 60.0,
+        reader_model: str | None = None,
+    ) -> None:
+        headers = _backend_auth_headers(backend_base_url, backend_api_key)
+        self.backend_base_url = backend_base_url
+        self.client = httpx.Client(base_url=backend_base_url, timeout=timeout, headers=headers)
+        self.max_words = max_words
+        self._model_id: str | None = reader_model
+        self._prefer_messages = "api.anthropic.com" in backend_base_url
+
+    def _pick_model(self, model_hint: str | None = None) -> str | None:
+        if self._model_id:
+            return self._model_id
+        if model_hint:
+            self._model_id = model_hint
+            return self._model_id
+        try:
+            r = self.client.get("/models")
+            if r.status_code == 200:
+                ids = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+                if ids:
+                    self._model_id = ids[0]
+        except Exception:
+            pass
+        return self._model_id
+
+    def read(self, state, query_embed, prev_summary: str) -> str:
+        return prev_summary or _profile_digest(state, query_embed, prev_summary)
+
+    def read_fold(
+        self,
+        state,
+        query_embed,
+        prev_summary: str,
+        folded_entries: list[tuple[str, str, str]],
+        model_hint: str | None = None,
+    ) -> str:
+        if not folded_entries:
+            return prev_summary
+        model = self._pick_model(model_hint=model_hint)
+        if not model:
+            return _profile_digest(state, query_embed, prev_summary)
+
+        turns = "\n".join(f"[{role}] {text}" for _, role, text in folded_entries)
+        prompt = (
+            f"Merge the existing notes and the new transcript lines below into one clean bullet list "
+            f"(max {self.max_words} words). Keep concrete entities, names, cities, ports, hosts, URLs, "
+            f"package/tool names, file paths, decisions, and preferences verbatim. "
+            f"Output only the bullet points with no preamble or commentary.\n\n"
+            f"Existing notes:\n{prev_summary or '(none)'}\n\n"
+            f"Transcript lines:\n{turns}"
+        )
+        try:
+            if self._prefer_messages:
+                text = self._call_messages(model, prompt)
+            else:
+                text = self._call_chat_completions(model, prompt)
+            if text:
+                return text
+        except Exception:
+            pass
+        return prev_summary or _profile_digest(state, query_embed, prev_summary)
+
+    def _call_chat_completions(self, model: str, prompt: str) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1536,
+        }
+        if "api.anthropic.com" not in self.backend_base_url:
+            payload["temperature"] = 0.0
+        resp = self.client.post("/chat/completions", json=payload)
+        resp.raise_for_status()
+        msg = resp.json()["choices"][0]["message"]
+        return (msg.get("content") or "").strip()
+
+    def _call_messages(self, model: str, prompt: str) -> str:
+        resp = self.client.post(
+            "/messages",
+            headers={"anthropic-version": "2023-06-01"},
+            json={
+                "model": model,
+                "max_tokens": 1536,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        blocks = resp.json().get("content") or []
+        parts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(parts).strip()
+
+
 class EmbeddingSidecar:
     """Embeds folded messages via an OpenAI-compatible /v1/embeddings backend."""
 
@@ -367,6 +564,10 @@ def create_app(
     proof_weights: str | Path | None = None,
     proof_work_root: str | Path = "runs/proofs",
     reader_sidecar_url: str | None = None,
+    reader_backend: str = "hybrid",
+    recall_top_k: int | None = None,
+    max_chunks: int = 2000,
+    reader_model: str | None = None,
 ) -> "FastAPI":
     if not FASTAPI_OK:  # pragma: no cover
         raise ImportError("fastapi is required for the proxy: uv sync --extra proxy")
@@ -375,8 +576,18 @@ def create_app(
     if reader is None:
         if reader_sidecar_url:
             reader = ReaderSidecarAdapter(reader_sidecar_url)
-        else:
+        elif reader_backend == "transformers":
+            reader = TransformersReaderAdapter(checkpoint, reader_decoder, device=reader_device)
+        elif reader_backend == "profile":
             reader = StudentReaderAdapter(checkpoint, reader_decoder, device=reader_device)
+        else:
+            reader = HybridReaderAdapter(
+                backend_base_url,
+                backend_api_key=backend_api_key,
+                reader_model=reader_model,
+            )
+    if recall_top_k is None:
+        recall_top_k = 4 if reader_backend == "hybrid" else 0
     if embed_fn is None:
         embed_fn = (
             LocalEmbeddingFn(embedding_base_url, embedding_model, embedding_api_key)
@@ -391,9 +602,11 @@ def create_app(
         reader=reader,
         hot_limit=hot_limit,
         keep_min=keep_min,
+        recall_top_k=recall_top_k,
+        max_chunks=max_chunks,
     )
 
-    backend_headers = {"Authorization": f"Bearer {backend_api_key}"} if backend_api_key else {}
+    backend_headers = _backend_auth_headers(backend_base_url, backend_api_key)
     app = FastAPI(title="MemoChain memory proxy", version="0.1.0")
     client = backend_client or httpx.AsyncClient(
         base_url=backend_base_url, timeout=None, headers=backend_headers
@@ -473,13 +686,14 @@ def create_app(
         if backend_ids and requested not in backend_ids:
             body["model"] = backend_ids[0]
 
-        rewritten, stats = mem.process(messages)
+        rewritten, stats = mem.process(messages, model_hint=body.get("model"))
         out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
         out_body["messages"] = rewritten
         stream = bool(out_body.get("stream"))
+        req_headers = _forward_auth_headers(request, backend_base_url)
 
         if not stream:
-            resp = await client.post("/chat/completions", json=out_body)
+            resp = await client.post("/chat/completions", json=out_body, headers=req_headers)
             if resp.status_code != 200:
                 return _error_json_response(resp.text, resp.status_code)
             payload = resp.json()
@@ -492,7 +706,9 @@ def create_app(
         # If the backend fails before streaming (e.g. 400/500), return a proper
         # non-200 OpenAI error JSON response instead of a malformed 200 SSE chunk.
         async def gen() -> AsyncIterator[bytes]:
-            async with client.stream("POST", "/chat/completions", json=out_body) as resp:
+            async with client.stream(
+                "POST", "/chat/completions", json=out_body, headers=req_headers
+            ) as resp:
                 if resp.status_code != 200:
                     err = (await resp.aread()).decode("utf-8", "replace")
                     yield f"data: {json.dumps(_parse_error_payload(err, resp.status_code))}\n\n".encode()
@@ -516,6 +732,56 @@ def create_app(
                             pass
 
         return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request) -> Any:
+        body = await request.json()
+        session_id = (
+            request.headers.get("x-session-id")
+            or request.headers.get("X-Session-Id")
+            or (body.get("metadata") or {}).get("user_id")
+            or body.get("session_id")
+        )
+        messages: list[dict[str, Any]] = body.get("messages") or []
+        mem = sessions.get(session_id, messages)
+
+        requested = body.get("model")
+        backend_ids = await _backend_model_ids()
+        if backend_ids and requested not in backend_ids:
+            body["model"] = backend_ids[0]
+
+        rewritten, stats = mem.process(
+            messages, model_hint=body.get("model"), inject_memory=False
+        )
+        out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
+        out_body["messages"] = rewritten
+        memory_block = stats.get("memory_block", "")
+        if memory_block:
+            out_body["system"] = _merge_anthropic_system(out_body.get("system"), memory_block)
+
+        req_headers = _forward_anthropic_headers(request, backend_base_url)
+        stream = bool(out_body.get("stream"))
+
+        if not stream:
+            resp = await client.post("/messages", json=out_body, headers=req_headers)
+            if resp.status_code != 200:
+                return _anthropic_error_response(resp.text, resp.status_code)
+            payload = resp.json()
+            payload["memochain"] = _stats_block(mem, stats)
+            return JSONResponse(payload)
+
+        async def gen_anthropic() -> AsyncIterator[bytes]:
+            async with client.stream(
+                "POST", "/messages", json=out_body, headers=req_headers
+            ) as resp:
+                if resp.status_code != 200:
+                    err = (await resp.aread()).decode("utf-8", "replace")
+                    yield f"event: error\ndata: {json.dumps(_parse_error_payload(err, resp.status_code))}\n\n".encode()
+                    return
+                async for line in resp.aiter_lines():
+                    yield f"{line}\n".encode()
+
+        return StreamingResponse(gen_anthropic(), media_type="text/event-stream")
 
     @app.get("/v1/memochain/status")
     async def status(session_id: str) -> dict[str, Any]:
@@ -544,6 +810,42 @@ def create_app(
         await client.aclose()
 
     return app
+
+
+def _forward_auth_headers(request: Request, backend_base_url: str) -> dict[str, str]:
+    """Pass through client auth headers only when present (preserves BYOK keys)."""
+    headers: dict[str, str] = {}
+    auth = request.headers.get("authorization")
+    x_api_key = request.headers.get("x-api-key")
+    if auth:
+        headers["Authorization"] = auth
+        if "api.anthropic.com" in backend_base_url and not x_api_key and auth.lower().startswith("bearer "):
+            headers["x-api-key"] = auth[7:].strip()
+    if x_api_key:
+        headers["x-api-key"] = x_api_key
+    workspace = request.headers.get("anthropic-workspace-id")
+    if workspace:
+        headers["anthropic-workspace-id"] = workspace
+    return headers
+
+
+def _forward_anthropic_headers(request: Request, backend_base_url: str) -> dict[str, str]:
+    headers = _forward_auth_headers(request, backend_base_url)
+    headers["anthropic-version"] = request.headers.get("anthropic-version") or "2023-06-01"
+    beta = request.headers.get("anthropic-beta")
+    if beta:
+        headers["anthropic-beta"] = beta
+    return headers
+
+
+def _anthropic_error_response(raw_text: str, status_code: int) -> "JSONResponse":
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return JSONResponse(parsed, status_code=status_code)
+    except ValueError:
+        pass
+    return _error_json_response(raw_text, status_code)
 
 
 def _parse_error_payload(raw_text: str, status_code: int) -> dict[str, Any]:
@@ -585,6 +887,7 @@ def _stats_block(mem: SessionMemory, stats: dict[str, Any]) -> dict[str, Any]:
         "fold_now": stats.get("fold"),
         "hot_messages": stats.get("hot_messages"),
         "hot_tokens": stats.get("hot_tokens"),
+        "recalled_chunks": stats.get("recalled_chunks", 0),
     }
 
 
@@ -603,39 +906,85 @@ def _hash_embed(texts: list[str]) -> np.ndarray:
     return out / norms
 
 
+def _env(name: str, default: str | None = None) -> str | None:
+    import os
+
+    return os.environ.get(name, default)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MemoChain OpenAI-compatible memory proxy")
-    parser.add_argument("--backend-base-url", required=True, help="e.g. http://localhost:8000/v1")
-    parser.add_argument("--backend-api-key", default=None)
-    parser.add_argument("--checkpoint", default="runs/pv4_10k", help="dir with student.pt")
-    parser.add_argument("--store-root", default="runs/sessions")
+    _backend_url = _env("MEMOCHAIN_BACKEND_BASE_URL")
+    parser.add_argument(
+        "--backend-base-url",
+        default=_backend_url,
+        required=_backend_url is None,
+        help="e.g. http://localhost:8000/v1 (or MEMOCHAIN_BACKEND_BASE_URL)",
+    )
+    parser.add_argument("--backend-api-key", default=_env("MEMOCHAIN_BACKEND_API_KEY"))
+    parser.add_argument("--checkpoint", default=_env("MEMOCHAIN_CHECKPOINT", "runs/pv4_10k"), help="dir with student.pt")
+    parser.add_argument("--store-root", default=_env("MEMOCHAIN_STORE_ROOT", "runs/sessions"))
     parser.add_argument(
         "--embedding-base-url",
-        default=None,
+        default=_env("MEMOCHAIN_EMBEDDING_BASE_URL"),
         help="OpenAI-compatible /v1 embeddings endpoint for real Qwen3-Embedding-4B; omit for offline hash-embed fallback",
     )
-    parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-4B")
-    parser.add_argument("--embedding-api-key", default=None)
-    parser.add_argument("--reader-decoder", default="Qwen/Qwen3-8B")
-    parser.add_argument("--reader-device", default="cpu")
+    parser.add_argument("--embedding-model", default=_env("MEMOCHAIN_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-4B"))
+    parser.add_argument("--embedding-api-key", default=_env("MEMOCHAIN_EMBEDDING_API_KEY"))
+    parser.add_argument("--reader-decoder", default=_env("MEMOCHAIN_READER_DECODER", "Qwen/Qwen3-8B"))
+    parser.add_argument("--reader-device", default=_env("MEMOCHAIN_READER_DEVICE", "cpu"))
+    parser.add_argument(
+        "--reader-backend",
+        default=_env("MEMOCHAIN_READER_BACKEND", "hybrid"),
+        choices=["hybrid", "transformers", "profile"],
+        help="reader mode: hybrid (default, backend fact sheet + top-K chunk recall, no reader LLM), transformers (in-process decoder LM), or profile (numpy recall profile only)",
+    )
+    _rk = _env("MEMOCHAIN_RECALL_TOP_K")
+    parser.add_argument(
+        "--recall-top-k",
+        type=int,
+        default=int(_rk) if _rk is not None else None,
+        help="verbatim old chunks retrieved per query (default 4 for hybrid, 0 otherwise)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=int(_env("MEMOCHAIN_MAX_CHUNKS", "2000")),
+        help="max stored SQLite chunks per session (ring buffer cap, 0 = unlimited, default 2000)",
+    )
     parser.add_argument(
         "--reader-sidecar-url",
-        default=None,
+        default=_env("MEMOCHAIN_READER_SIDECAR_URL"),
         help="reader sidecar base URL (e.g. http://localhost:8002) for natural-language memory notes",
     )
-    parser.add_argument("--hot-limit", type=int, default=80000, help="conversation hot-window token limit (excluding system prompt)")
-    parser.add_argument("--keep-min", type=int, default=40000, help="min conversation tokens kept hot after folding")
+    parser.add_argument(
+        "--hot-limit",
+        type=int,
+        default=int(_env("MEMOCHAIN_HOT_LIMIT", "80000")),
+        help="conversation hot-window token limit (excluding system prompt)",
+    )
+    parser.add_argument(
+        "--keep-min",
+        type=int,
+        default=int(_env("MEMOCHAIN_KEEP_MIN", "40000")),
+        help="min conversation tokens kept hot after folding",
+    )
     parser.add_argument(
         "--proof-mode",
-        default=None,
+        default=_env("MEMOCHAIN_PROOF_MODE"),
         choices=[None, "execute", "prove"],
         help="background SP1 verification: execute (fast guest replay check) or prove (recursive STARK)",
     )
     parser.add_argument("--ivc-bin", default="crates/sp1/script/target/release/ivc")
     parser.add_argument("--proof-weights", default=None, help="weights.bin for the prover (default: <checkpoint>/weights.bin)")
     parser.add_argument("--proof-work-root", default="runs/proofs")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument(
+        "--reader-model",
+        default=_env("MEMOCHAIN_READER_MODEL"),
+        help="model id for hybrid fold summaries (defaults to backend /models or last chat model)",
+    )
+    parser.add_argument("--host", default=_env("MEMOCHAIN_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(_env("MEMOCHAIN_PORT", "9000")))
     args = parser.parse_args()
 
     import uvicorn
@@ -657,6 +1006,10 @@ def main() -> None:
         proof_weights=args.proof_weights,
         proof_work_root=args.proof_work_root,
         reader_sidecar_url=args.reader_sidecar_url,
+        reader_backend=args.reader_backend,
+        recall_top_k=args.recall_top_k,
+        max_chunks=args.max_chunks,
+        reader_model=args.reader_model,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

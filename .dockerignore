@@ -1,0 +1,16 @@
+.git
+.venv
+runs
+data
+checkpoints
+crates
+docs
+paper
+site
+tests
+tools
+*.md
+!README.md
+*.tar.gz
+*.bin
+__pycache__

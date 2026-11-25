@@ -19,6 +19,7 @@ train = [
     "safetensors>=0.4",
     "huggingface-hub>=0.25",
     "pyarrow>=18",
+    "transformers>=4.46",
 ]
 
 [build-system]
