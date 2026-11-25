@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from datetime import datetime, timezone
@@ -57,6 +58,7 @@ def run_endpoint(
     auth: str | None,
     max_out_tokens: int,
     timeout: float,
+    redact_url: bool = False,
 ) -> dict:
     headers = {}
     if auth:
@@ -77,41 +79,61 @@ def run_endpoint(
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            t0 = time.perf_counter()
-            ttft = None
-            usage = None
-            memo = None
-            reply = ""
-            with client.stream("POST", "/chat/completions", json=body, headers=headers) as r:
-                if r.status_code != 200:
-                    raise RuntimeError(f"[{name}] turn {i}: HTTP {r.status_code}: {r.read()[:400]!r}")
-                for line in r.iter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        continue
-                    if ttft is None:
-                        ttft = time.perf_counter() - t0
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    if not isinstance(chunk, dict):
-                        continue
-                    if chunk.get("error"):
-                        raise RuntimeError(f"[{name}] turn {i}: backend error: {chunk['error']}")
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-                    if chunk.get("memochain"):
-                        memo = chunk["memochain"]
-                    for ch in chunk.get("choices") or []:
-                        delta = ch.get("delta") or {}
-                        reply += delta.get("content") or ""
+            for attempt in range(4):
+                t0 = time.perf_counter()
+                ttft = None
+                usage = None
+                memo = None
+                reply = ""
+                retry_err = None
+                with client.stream("POST", "/chat/completions", json=body, headers=headers) as r:
+                    if r.status_code in (429, 502, 503, 504):
+                        retry_err = f"HTTP {r.status_code}: {r.read()[:200]!r}"
+                    elif r.status_code != 200:
+                        raise RuntimeError(f"[{name}] turn {i}: HTTP {r.status_code}: {r.read()[:400]!r}")
+                    else:
+                        for line in r.iter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                continue
+                            if ttft is None:
+                                ttft = time.perf_counter() - t0
+                            try:
+                                chunk = json.loads(data)
+                            except ValueError:
+                                continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            if chunk.get("error"):
+                                err = chunk["error"]
+                                code = err.get("code") if isinstance(err, dict) else None
+                                if code in (429, 502, 503, 504):
+                                    retry_err = str(err)[:200]
+                                    break
+                                raise RuntimeError(f"[{name}] turn {i}: backend error: {err}")
+                            if chunk.get("usage"):
+                                usage = chunk["usage"]
+                            if chunk.get("memochain"):
+                                memo = chunk["memochain"]
+                            for ch in chunk.get("choices") or []:
+                                delta = ch.get("delta") or {}
+                                reply += delta.get("content") or ""
+                if retry_err is None:
+                    break
+                if attempt == 3:
+                    raise RuntimeError(f"[{name}] turn {i}: failed after retries: {retry_err}")
+                wait_s = 3.0 * (attempt + 1)
+                print(f"[{name}] turn {i + 1}: transient error ({retry_err}), sleeping {wait_s}s", flush=True)
+                time.sleep(wait_s)
             total = time.perf_counter() - t0
+            cached = ((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens")
             row = {
                 "turn": i,
                 "prompt_tokens": usage.get("prompt_tokens") if usage else None,
+                "cached_tokens": cached,
+                "completion_tokens": usage.get("completion_tokens") if usage else None,
                 "cost": usage.get("cost") if usage else None,
                 "ttft_s": round(ttft, 3) if ttft is not None else None,
                 "total_s": round(total, 3),
@@ -121,14 +143,16 @@ def run_endpoint(
                 if memo.get("fold"):
                     print(f"[{name}] turn {i}: FOLD {memo['fold']}", flush=True)
             rows.append(row)
+            cost_s = f" cost=${row['cost']:.6f}" if row["cost"] is not None else ""
             print(
                 f"[{name}] turn {i + 1}/{turns} "
-                f"prompt_tokens={row['prompt_tokens']} ttft={row['ttft_s']}s",
+                f"prompt_tokens={row['prompt_tokens']} cached={cached}{cost_s} ttft={row['ttft_s']}s",
                 flush=True,
             )
             history.append(user_msg)
             history.append({"role": "assistant", "content": reply or "(ok)"})
-    return {"name": name, "base_url": base_url, "session_id": session_id, "turns": rows}
+    display_url = "<local-proxy>/v1" if redact_url else base_url
+    return {"name": name, "base_url": display_url, "session_id": session_id, "turns": rows}
 
 
 def _fold_turns(rows: list[dict]) -> set[int]:
@@ -234,8 +258,20 @@ def write_report(out_dir: Path, meta: dict, results: list[dict]) -> Path:
         cells = " | ".join(f"${s['total_input_tokens'] * price / 1e6:.2f}" for _, price in PRICE_POINTS)
         lines.append(f"| {r['name']} | {cells} |")
     if d["total_cost"] is not None:
-        lines.append("\nOpenRouter-metered cost: "
-                     + ", ".join(f"{r['name']}: ${sums[r['name']]['total_cost']}" for r in results))
+        lines.append("\n## Actual OpenRouter-billed cost (`usage.cost` returned by OpenRouter)\n")
+        lines.append("| Endpoint | Metered `usage.cost` | Reduction vs direct |")
+        lines.append("| --- | --- | --- |")
+        lines.append(f"| {direct['name']} | **${d['total_cost']:.4f}** | baseline |")
+        for r in results[1:]:
+            s = sums[r["name"]]
+            if s["total_cost"] is not None and d["total_cost"] > 0:
+                cred = 100.0 * (1 - s["total_cost"] / d["total_cost"])
+                lines.append(f"| {r['name']} | **${s['total_cost']:.4f}** | **{cred:.1f}%** |")
+        lines.append(
+            "\nNote: OpenRouter `usage.cost` on proxied chat turns measures the main chat calls; "
+            "each fold turn also makes one compact hybrid summary call (~1.5k in / ~300 out) "
+            "using the same BYOK key.\n"
+        )
 
     lines.append("\n## Projection (same fold cadence, longer sessions)\n")
     lines.append("Post-fold prompt size is constant, so savings grow with session length. "
@@ -285,8 +321,17 @@ def main() -> None:
     ap.add_argument("--max-out-tokens", type=int, default=12)
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--auth", default=None, help='Authorization header value, e.g. "Bearer sk-..."')
+    ap.add_argument("--auth-env", default=None, help="Env var holding a Bearer API key (avoids putting keys in argv)")
+    ap.add_argument("--redact-proxy-urls", action="store_true", help="Replace non-baseline endpoint URLs with <local-proxy>/v1 in saved reports")
     ap.add_argument("--out", default="tools/bench_results")
     args = ap.parse_args()
+
+    auth = args.auth
+    if not auth and args.auth_env:
+        tok = os.environ.get(args.auth_env, "").strip()
+        if not tok:
+            ap.error(f"--auth-env {args.auth_env} is unset or empty")
+        auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
 
     endpoints = []
     for spec in args.endpoint:
@@ -305,10 +350,11 @@ def main() -> None:
         "max_out_tokens": args.max_out_tokens,
     }
     results = []
-    for name, url in endpoints:
+    for idx, (name, url) in enumerate(endpoints):
         results.append(
             run_endpoint(name, url, args.model, args.turns, args.tokens_per_turn,
-                         args.auth, args.max_out_tokens, args.timeout)
+                         auth, args.max_out_tokens, args.timeout,
+                         redact_url=(args.redact_proxy_urls and idx > 0))
         )
         time.sleep(1.0)
 
