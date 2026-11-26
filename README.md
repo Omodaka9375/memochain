@@ -122,7 +122,18 @@ PYTHONPATH=src python -m memochain.server \
 
 Pass `--checkpoint path/to/weights.bin` (or a directory with `weights.bin`,
 `np_*.npy`, or `student.pt`) when pairing the proxy with a trained neural
-reader or SP1 proof verification. Without `--checkpoint`, MemoChain uses a
+reader or SP1 proof verification. The trained writer weights are published as
+a GitHub release asset:
+
+```bash
+curl -L -O https://github.com/Omodaka9375/memochain/releases/download/v0.1.0/weights.bin
+curl -L -O https://github.com/Omodaka9375/memochain/releases/download/v0.1.0/weights.bin.sha256
+sha256sum -c weights.bin.sha256
+```
+
+Expected digest: `626e2089fe38bc593ebf8421873739438aa47b86408db10bafc4eb424f82d67b`.
+Or mount the file into the container and set `MEMOCHAIN_CHECKPOINT=/checkpoints/weights.bin`.
+Without `--checkpoint`, MemoChain uses a
 built-in fixed-seed Q14 writer so the proxy boots immediately and still
 produces exact 22 KB capsules and SHA-256 receipt chains. For reasoning-heavy
 models (which spend tokens thinking before emitting the bullet summary), set
@@ -173,7 +184,7 @@ cd ../script && cargo build --release --bin ivc
 
 ## Status
 
-Phases 1-21 complete: integer Delta-rule fold (bit-identical across
+Phases 1-22 complete: integer Delta-rule fold (bit-identical across
 machines), O(1) receipt chain, versioned capsules, distilled student +
 end-to-end distillation-free training (Qwen3-8B e2e matches the Memorilla
 teacher's held-out accuracy at 64.69% vs 64.76% from the 22 KB capsule with
@@ -182,10 +193,19 @@ capacity scaling ablation (gain saturates by 10 KiB; the 22 KiB Mina-sized
 state is past the knee), coding-domain transfer on real sessions, slim
 single-container hybrid proxy (OpenAI + Anthropic `/v1/messages`, BYOK
 pass-through, int8 FIFO-capped SQLite recall, cross-container shared
-sessions), and a 120-turn A/B benchmark measuring 90% input-token
-reduction. Everything except the Qwen3-8B benchmarks runs on a 12 GB GPU
-or CPU only. See [DESIGN.md](DESIGN.md) for the phase-by-phase results
-and negative results.
+sessions, zero-config deterministic-writer fallback, per-request model
+hints, multi-arch image), and a 120-turn A/B benchmark measuring 90%
+input-token reduction. Everything except the Qwen3-8B benchmarks runs on a
+12 GB GPU or CPU only. See [DESIGN.md](DESIGN.md) for the phase-by-phase
+results and negative results.
+
+Test suite (CPU-only machine, torch absent): 56 Python tests collected,
+55 passed / 6 skipped (6 skips are torch-only tests); on a torch-enabled
+host all 74 collected Python tests run. Rust: 14 tests across
+`memochain-core` (10) and `chain-logic` (4). Both suites run without GPU.
+
+Deployment: multi-arch image published to
+`ghcr.io/omodaka9375/memochain:latest` (linux/amd64 + linux/arm64).
 
 Known limits (detailed in DESIGN.md and PAPER.md Section 6): the 22 KB
 state holds gist and preferences well (~350 orthogonal fact slots) but
