@@ -1,8 +1,13 @@
 # MemoChain memory proxy: one container in front of any OpenAI-compatible
-# model server. Point clients at :9000 and swap the backend freely.
+# or Anthropic backend. Point clients at :9000 (local) or :9001 (OpenRouter).
 #
 #   docker compose up -d
-#   curl localhost:9000/v1/models
+#   curl localhost:9000/healthz
+#
+# Works out of the box with zero downloads (built-in deterministic Q14 writer +
+# hybrid fact-sheet + SQLite recall). To use trained neural-reader weights,
+# place weights.bin (or exported np_*.npy) under ./checkpoints/student and
+# uncomment the checkpoints volume + MEMOCHAIN_CHECKPOINT below.
 #
 # Optional services / overrides:
 #  - embedding:  real Qwen3-Embedding-4B via vLLM (else offline hash-embed)
@@ -20,7 +25,7 @@ services:
     ports:
       - "9000:9000"
     environment:
-      # Pick one backend (default: local OpenAI-compatible server like Inkling/vLLM/llama.cpp/Ollama):
+      # Pick one backend (default: local OpenAI-compatible server like vLLM/llama.cpp/Ollama/LM Studio):
       MEMOCHAIN_BACKEND_BASE_URL: http://host.docker.internal:8000/v1
       # MEMOCHAIN_BACKEND_API_KEY: ""                                   # optional for local; required for OpenRouter/Anthropic
 
@@ -32,19 +37,23 @@ services:
       # MEMOCHAIN_BACKEND_BASE_URL: https://api.anthropic.com/v1
       # MEMOCHAIN_BACKEND_API_KEY: sk-ant-...
 
-      MEMOCHAIN_CHECKPOINT: /checkpoints/student                        # exported np_*.npy weights
+      # Optional: mount trained weights (weights.bin or np_*.npy) for neural reader / SP1 parity.
+      # When omitted or missing, MemoChain uses its built-in deterministic Q14 writer.
+      # MEMOCHAIN_CHECKPOINT: /checkpoints/student
       MEMOCHAIN_STORE_ROOT: /data/sessions
       MEMOCHAIN_READER_BACKEND: hybrid                                  # default: backend fact sheet + top-K chunk recall
+      # MEMOCHAIN_READER_MODEL: ""                                      # optional: pin a fast non-reasoning model for fold summaries
+      # MEMOCHAIN_READER_MAX_TOKENS: "4096"
       # MEMOCHAIN_RECALL_TOP_K: "4"
       # MEMOCHAIN_MAX_CHUNKS: "2000"                                    # ring-buffer cap on int8 SQLite chunks (~7 MB max/session)
-      # MEMOCHAIN_EMBEDDING_BASE_URL: http://embedding:8001/v1         # uncomment with the service below
+      # MEMOCHAIN_EMBEDDING_BASE_URL: http://embedding:8001/v1          # uncomment with the service below
       # MEMOCHAIN_READER_BACKEND: transformers
       # MEMOCHAIN_READER_DECODER: Qwen/Qwen3-0.6B
       # MEMOCHAIN_READER_DEVICE: cpu
       # MEMOCHAIN_HOT_LIMIT: "80000"
       # MEMOCHAIN_KEEP_MIN: "40000"
     volumes:
-      - ./checkpoints:/checkpoints:ro
+      # - ./checkpoints:/checkpoints:ro
       - memochain-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -58,15 +67,17 @@ services:
     environment:
       MEMOCHAIN_BACKEND_BASE_URL: https://openrouter.ai/api/v1
       # MEMOCHAIN_BACKEND_API_KEY: sk-or-v1-...                         # optional: clients can pass their own key (BYOK)
-      MEMOCHAIN_CHECKPOINT: /checkpoints/student
+      # MEMOCHAIN_CHECKPOINT: /checkpoints/student
       MEMOCHAIN_STORE_ROOT: /data/sessions
       MEMOCHAIN_READER_BACKEND: hybrid
+      # MEMOCHAIN_READER_MODEL: ""                                      # optional: e.g. a fast non-reasoning model for fold summaries
+      # MEMOCHAIN_READER_MAX_TOKENS: "4096"
       # MEMOCHAIN_RECALL_TOP_K: "4"
       # MEMOCHAIN_MAX_CHUNKS: "2000"
       # MEMOCHAIN_HOT_LIMIT: "80000"
       # MEMOCHAIN_KEEP_MIN: "40000"
     volumes:
-      - ./checkpoints:/checkpoints:ro
+      # - ./checkpoints:/checkpoints:ro
       - memochain-data:/data                                            # shared session memory with :9000
     restart: unless-stopped
 

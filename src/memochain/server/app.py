@@ -1,10 +1,11 @@
 """MemoChain OpenAI-compatible memory proxy.
 
-Sits between any OpenAI-compatible client (KAI, IDEs, agent harnesses) and
-any OpenAI-compatible backend (vLLM, llama.cpp server, cloud APIs). Per
-session it keeps recent turns verbatim (hot window), folds evicted old turns
-into the 22 KB Q14 Capsule through the exact integer student writer, and
-injects a compact recalled digest into the system prompt.
+Sits between any OpenAI-compatible or Anthropic client (Claude Code, IDEs,
+agent harnesses) and any backend (vLLM, llama.cpp server, Ollama, LM Studio,
+OpenRouter, Anthropic). Per session it keeps recent turns verbatim (hot
+window), folds evicted old turns into the 22 KB Q14 Capsule through the exact
+integer student writer, and injects a compact recalled digest into the system
+prompt.
 
 Run:
   uv run --extra proxy python -m memochain.server \
@@ -49,17 +50,44 @@ except ImportError:  # pragma: no cover
 class IntWriterAdapter:
     """Adapts IntStudentWriter to the FoldWriter protocol with per-doc receipts.
 
-    ``checkpoint`` may be a training dir with student.pt (needs torch) or a
-    dir of pre-exported numpy arrays (np_key_w.npy etc., torch-free, for
-    torch-free proxy hosts).
+    ``checkpoint`` may be:
+      - a ``weights.bin`` file or a directory containing ``weights.bin``
+        (canonical 3.6 MB Q14 binary, torch-free),
+      - a directory of pre-exported numpy arrays (``np_key_w.npy`` etc.,
+        torch-free),
+      - a training directory with ``student.pt`` (requires torch), or
+      - ``None`` / ``"default"`` / a missing path when ``allow_deterministic_fallback``
+        is enabled: falls back to a fixed-seed deterministic Q14 writer so
+        first-time users can boot the proxy with zero external downloads
+        (still producing exact 22 KB capsules and valid SHA-256 receipts).
     """
 
-    def __init__(self, checkpoint: str | Path) -> None:
+    def __init__(
+        self,
+        checkpoint: str | Path | None = None,
+        *,
+        allow_deterministic_fallback: bool = True,
+    ) -> None:
         from ..student_int import IntStudentWriter
 
+        self.weights_source = "checkpoint"
+        if checkpoint is None or str(checkpoint).strip() in ("", "none", "default"):
+            if not allow_deterministic_fallback:
+                raise FileNotFoundError("No MemoChain checkpoint specified")
+            self.inner = _default_deterministic_writer()
+            self.weights_source = "deterministic-fallback"
+            self._digest = self.inner.weights_digest()
+            return
+
         path = Path(checkpoint)
+        weights_bin = path if path.is_file() and path.name.endswith(".bin") else path / "weights.bin"
         np_key_w = path / "np_key_w.npy"
-        if np_key_w.exists():  # torch-free numpy checkpoint
+        student_pt = path if path.is_file() and path.name.endswith(".pt") else path / "student.pt"
+
+        if weights_bin.is_file():
+            self.inner = IntStudentWriter.from_bytes(weights_bin.read_bytes())
+            self.weights_source = str(weights_bin)
+        elif np_key_w.exists():  # torch-free numpy checkpoint
             arrays = {
                 "w_key": np.load(path / "np_key_w.npy"),
                 "b_key": np.load(path / "np_key_b.npy"),
@@ -75,8 +103,26 @@ class IntWriterAdapter:
                         "(export with tools/export_np_weights.py, NOT raw floats)"
                     )
             self.inner = IntStudentWriter(**arrays)
+            self.weights_source = str(path)
+        elif student_pt.is_file():
+            self.inner = IntStudentWriter.from_checkpoint(student_pt)
+            self.weights_source = str(student_pt)
+        elif allow_deterministic_fallback:
+            import logging
+
+            logging.getLogger("memochain.server").warning(
+                "Checkpoint %s not found; using built-in deterministic Q14 writer "
+                "(capsules and SHA-256 receipts remain exact; mount weights.bin or "
+                "np_*.npy under MEMOCHAIN_CHECKPOINT for trained neural-reader weights).",
+                path,
+            )
+            self.inner = _default_deterministic_writer()
+            self.weights_source = "deterministic-fallback"
         else:
-            self.inner = IntStudentWriter.from_checkpoint(path)
+            raise FileNotFoundError(
+                f"MemoChain checkpoint not found at {path} "
+                "(expected weights.bin, np_key_w.npy, or student.pt)"
+            )
         self._digest = self.inner.weights_digest()
 
     def weights_digest(self) -> str:
@@ -111,6 +157,27 @@ class IntWriterAdapter:
                 }
             )
         return MemoryState(state), head, rows
+
+
+def _default_deterministic_writer():
+    """Built-in fixed-seed Q14 writer for zero-download hybrid proxy starts.
+
+    Produces canonical 22,528-byte capsules and SHA-256 receipt chains that
+    verify identically in Python and Rust without requiring a pre-trained
+    checkpoint file. For trained neural-reader decoding, supply ``weights.bin``,
+    ``np_*.npy``, or ``student.pt`` via ``--checkpoint`` / ``MEMOCHAIN_CHECKPOINT``.
+    """
+    from ..student_int import EMBED_DIM, KEY_PART, N_HEADS, Q_ONE, IntStudentWriter
+
+    rng = np.random.default_rng(20260417)
+    scale = Q_ONE / np.sqrt(EMBED_DIM)
+    w_key = np.clip(np.round(rng.standard_normal((KEY_PART, EMBED_DIM)) * scale), -32768, 32767).astype("<i2")
+    b_key = np.zeros(KEY_PART, dtype="<i2")
+    w_val = np.clip(np.round(rng.standard_normal((KEY_PART, EMBED_DIM)) * scale), -32768, 32767).astype("<i2")
+    b_val = np.zeros(KEY_PART, dtype="<i2")
+    beta = np.full(N_HEADS, int(round(0.25 * Q_ONE)), dtype="<i2")
+    decay = np.full(N_HEADS, int(round(0.95 * Q_ONE)), dtype="<i2")
+    return IntStudentWriter(w_key=w_key, b_key=b_key, w_val=w_val, b_val=b_val, beta=beta, decay=decay)
 
 
 # --------------------------------------------------------------------------
@@ -382,21 +449,25 @@ class HybridReaderAdapter:
         max_words: int = 220,
         timeout: float = 60.0,
         reader_model: str | None = None,
+        max_tokens: int = 4096,
     ) -> None:
         headers = _backend_auth_headers(backend_base_url, backend_api_key)
         self.backend_base_url = backend_base_url
         self.client = httpx.Client(base_url=backend_base_url, timeout=timeout, headers=headers)
         self.max_words = max_words
+        self.max_tokens = max_tokens
+        self._pinned_model: str | None = reader_model
         self._model_id: str | None = reader_model
         self._prefer_messages = "api.anthropic.com" in backend_base_url
 
     def _pick_model(
         self, model_hint: str | None = None, auth_headers: dict[str, str] | None = None
     ) -> str | None:
-        if self._model_id:
-            return self._model_id
+        if self._pinned_model:
+            return self._pinned_model
         if model_hint:
-            self._model_id = model_hint
+            return model_hint
+        if self._model_id:
             return self._model_id
         try:
             r = self.client.get("/models", headers=auth_headers) if auth_headers else self.client.get("/models")
@@ -452,7 +523,7 @@ class HybridReaderAdapter:
         payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1536,
+            "max_tokens": self.max_tokens,
         }
         if "api.anthropic.com" not in self.backend_base_url:
             payload["temperature"] = 0.0
@@ -476,7 +547,7 @@ class HybridReaderAdapter:
             headers=hdrs,
             json={
                 "model": model,
-                "max_tokens": 1536,
+                "max_tokens": self.max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -586,6 +657,7 @@ def create_app(
     recall_top_k: int | None = None,
     max_chunks: int = 2000,
     reader_model: str | None = None,
+    reader_max_tokens: int = 4096,
 ) -> "FastAPI":
     if not FASTAPI_OK:  # pragma: no cover
         raise ImportError("fastapi is required for the proxy: uv sync --extra proxy")
@@ -603,6 +675,7 @@ def create_app(
                 backend_base_url,
                 backend_api_key=backend_api_key,
                 reader_model=reader_model,
+                max_tokens=reader_max_tokens,
             )
     if recall_top_k is None:
         recall_top_k = 4 if reader_backend == "hybrid" else 0
@@ -683,6 +756,8 @@ def create_app(
             "backend": backend_base_url,
             "sessions": len(sessions.sessions),
             "proof_mode": proof_mode,
+            "weights_source": getattr(writer, "weights_source", "custom"),
+            "weights_digest": writer.weights_digest()[:16],
         }
 
     @app.post("/v1/chat/completions")
@@ -945,7 +1020,11 @@ def main() -> None:
         help="e.g. http://localhost:8000/v1 (or MEMOCHAIN_BACKEND_BASE_URL)",
     )
     parser.add_argument("--backend-api-key", default=_env("MEMOCHAIN_BACKEND_API_KEY"))
-    parser.add_argument("--checkpoint", default=_env("MEMOCHAIN_CHECKPOINT", "runs/pv4_10k"), help="dir with student.pt")
+    parser.add_argument(
+        "--checkpoint",
+        default=_env("MEMOCHAIN_CHECKPOINT", ""),
+        help="path to weights.bin, np_*.npy dir, or student.pt dir (omit for built-in deterministic Q14 writer)",
+    )
     parser.add_argument("--store-root", default=_env("MEMOCHAIN_STORE_ROOT", "runs/sessions"))
     parser.add_argument(
         "--embedding-base-url",
@@ -1004,7 +1083,13 @@ def main() -> None:
     parser.add_argument(
         "--reader-model",
         default=_env("MEMOCHAIN_READER_MODEL"),
-        help="model id for hybrid fold summaries (defaults to backend /models or last chat model)",
+        help="model id for hybrid fold summaries (defaults to active request model or backend /models)",
+    )
+    parser.add_argument(
+        "--reader-max-tokens",
+        type=int,
+        default=int(_env("MEMOCHAIN_READER_MAX_TOKENS", "4096")),
+        help="max_tokens for hybrid fold-summary call (default 4096 to give reasoning models headroom)",
     )
     parser.add_argument("--host", default=_env("MEMOCHAIN_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(_env("MEMOCHAIN_PORT", "9000")))
@@ -1015,7 +1100,7 @@ def main() -> None:
     app = create_app(
         backend_base_url=args.backend_base_url,
         backend_api_key=args.backend_api_key,
-        checkpoint=args.checkpoint,
+        checkpoint=args.checkpoint or None,
         store_root=args.store_root,
         embedding_base_url=args.embedding_base_url,
         embedding_model=args.embedding_model,
@@ -1033,6 +1118,7 @@ def main() -> None:
         recall_top_k=args.recall_top_k,
         max_chunks=args.max_chunks,
         reader_model=args.reader_model,
+        reader_max_tokens=args.reader_max_tokens,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

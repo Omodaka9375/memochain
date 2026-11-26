@@ -243,18 +243,18 @@ def test_create_app_and_http_flow(tmp_path, monkeypatch) -> None:
     r = c.post(
         "/v1/chat/completions",
         json={"model": "test", "messages": big},
-        headers={"x-session-id": "kai-test"},
+        headers={"x-session-id": "client-test"},
     )
     assert r.status_code == 200
     payload = r.json()
     assert "memochain" in payload
-    assert payload["memochain"]["session_id"] == "kai-test"
+    assert payload["memochain"]["session_id"] == "client-test"
     assert payload["memochain"]["folded_messages"] >= 0
     assert fake_backend.calls == 1
     # memory block injected into the outgoing system message
     sent = fake_backend.last_json["messages"] if hasattr(fake_backend, "last_json") else None
 
-    v = c.get("/v1/memochain/verify", params={"session_id": "kai-test"})
+    v = c.get("/v1/memochain/verify", params={"session_id": "client-test"})
     assert v.status_code == 200 and v.json()["ok"] is True
 
 
@@ -398,7 +398,7 @@ def test_hybrid_reader_adapter_calls_backend(monkeypatch) -> None:
 
     def fake_get(url: str):
         calls.append((url, None))
-        return FakeResp(200, {"data": [{"id": "inkling-2-mini"}]})
+        return FakeResp(200, {"data": [{"id": "local-test-model"}]})
 
     def fake_post(url: str, json: dict):
         calls.append((url, json))
@@ -416,7 +416,7 @@ def test_hybrid_reader_adapter_calls_backend(monkeypatch) -> None:
     assert "Lisbon" in out
     assert calls[0][0] == "/models"
     assert calls[1][0] == "/chat/completions"
-    assert calls[1][1]["model"] == "inkling-2-mini"
+    assert calls[1][1]["model"] == "local-test-model"
 
 
 def test_anthropic_sse_passthrough_and_openai_direct_claude_auth(tmp_path) -> None:
@@ -616,7 +616,7 @@ def test_anthropic_messages_endpoint_and_direct_reader(tmp_path, monkeypatch) ->
 
 
 def test_messages_normalizes_model_for_local_vllm_backend(tmp_path) -> None:
-    """Claude Code style /v1/messages client works against local Inkling/vLLM too."""
+    """Claude Code style /v1/messages client works against local vLLM/OpenAI servers too."""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from memochain.server import app as app_mod
@@ -629,7 +629,7 @@ def test_messages_normalizes_model_for_local_vllm_backend(tmp_path) -> None:
                 status_code = 200
 
                 def json(self):
-                    return {"data": [{"id": "inkling-2-mini"}]}
+                    return {"data": [{"id": "local-test-model"}]}
 
             return R()
 
@@ -663,7 +663,7 @@ def test_messages_normalizes_model_for_local_vllm_backend(tmp_path) -> None:
     )
     assert r.status_code == 200
     assert seen[0]["url"] == "/messages"
-    assert seen[0]["json"]["model"] == "inkling-2-mini"
+    assert seen[0]["json"]["model"] == "local-test-model"
 
 
 def test_chunk_store_int8_quantization_ring_cap_and_legacy_float32(tmp_path) -> None:
@@ -848,6 +848,73 @@ def test_shared_volume_sync_from_disk_across_two_managers(tmp_path) -> None:
     assert stats_cloud["fold"] is None  # already folded by local proxy, not re-folded
     assert stats_cloud["recalled_chunks"] >= 1
     assert "ALPHA-99" in out_cloud[0]["content"]
+
+
+def test_zero_config_deterministic_writer_and_weights_bin_loading(tmp_path) -> None:
+    """Proxy boots with no checkpoint (deterministic fallback) and loads standalone weights.bin."""
+    from memochain.server import app as app_mod
+
+    w_none = app_mod.IntWriterAdapter(None)
+    w_missing = app_mod.IntWriterAdapter(tmp_path / "does_not_exist")
+    assert w_none.weights_source == "deterministic-fallback"
+    assert w_missing.weights_source == "deterministic-fallback"
+    assert w_none.weights_digest() == w_missing.weights_digest()
+
+    # Round-trip through canonical weights.bin (file path and directory path)
+    bin_dir = tmp_path / "ckpt"
+    bin_dir.mkdir()
+    bin_file = bin_dir / "weights.bin"
+    bin_file.write_bytes(w_none.inner.to_bytes())
+
+    w_from_dir = app_mod.IntWriterAdapter(bin_dir)
+    w_from_file = app_mod.IntWriterAdapter(bin_file)
+    assert w_from_dir.weights_digest() == w_none.weights_digest()
+    assert w_from_file.weights_digest() == w_none.weights_digest()
+
+    docs = np.zeros((2, 2560), dtype="<i2")
+    docs[0, 0] = 1000
+    docs[1, 1] = -1000
+    s1, h1, _ = w_none.fold_with_receipts(docs)
+    s2, h2, _ = w_from_dir.fold_with_receipts(docs)
+    assert np.array_equal(s1.tokens, s2.tokens)
+    assert h1.accumulator == h2.accumulator
+
+
+def test_hybrid_reader_respects_per_request_model_hint(monkeypatch) -> None:
+    """Without a pinned reader_model, multi-model proxies follow each request's model_hint."""
+    from memochain.server import app as app_mod
+
+    seen_models: list[str] = []
+
+    class FakeResp:
+        def __init__(self, body):
+            self.status_code = 200
+            self._body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._body
+
+    def fake_post(url: str, json: dict, headers=None):
+        seen_models.append(json["model"])
+        assert json["max_tokens"] == 4096
+        return FakeResp({"choices": [{"message": {"content": "- noted"}}]})
+
+    adapter = app_mod.HybridReaderAdapter("https://openrouter.ai/api/v1")
+    monkeypatch.setattr(adapter.client, "post", fake_post)
+
+    adapter.read_fold(None, np.zeros(2560, dtype=np.float32), "", [("h1", "user", "a")], model_hint="model-a")
+    adapter.read_fold(None, np.zeros(2560, dtype=np.float32), "", [("h2", "user", "b")], model_hint="model-b")
+    assert seen_models == ["model-a", "model-b"]
+
+    # Pinned reader_model overrides model_hint
+    pinned = app_mod.HybridReaderAdapter("https://openrouter.ai/api/v1", reader_model="fast-summarizer")
+    monkeypatch.setattr(pinned.client, "post", fake_post)
+    pinned.read_fold(None, np.zeros(2560, dtype=np.float32), "", [("h3", "user", "c")], model_hint="model-b")
+    assert seen_models[-1] == "fast-summarizer"
+
 
 
 

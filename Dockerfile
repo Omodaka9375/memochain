@@ -1,9 +1,10 @@
 # MemoChain memory proxy - single tight container.
 #
 # Default build: numpy-only hybrid proxy (~57 MB RSS, 0 extra GPU):
-#   - exact Q14 22 KB capsule + sha256 receipt chain
+#   - exact Q14 22 KB capsule + sha256 receipt chain (zero-download built-in
+#     deterministic writer; optionally mount trained weights.bin or np_*.npy)
 #   - backend fact-sheet digest + SQLite top-K verbatim chunk recall
-#   - works out of the box with any OpenAI-compatible backend
+#   - works out of the box with any OpenAI-compatible or Anthropic backend
 #
 # Optional neural-reader build:
 #   docker build --build-arg WITH_READER=1 .
@@ -27,10 +28,11 @@ RUN pip install --no-cache-dir ".[proxy]" \
 # all runtime config flows through MEMOCHAIN_* env vars
 ENV MEMOCHAIN_HOST=0.0.0.0 \
     MEMOCHAIN_PORT=9000 \
-    MEMOCHAIN_BACKEND_BASE_URL=http://backend:8000/v1 \
-    MEMOCHAIN_CHECKPOINT=/checkpoints/student \
+    MEMOCHAIN_BACKEND_BASE_URL=http://host.docker.internal:8000/v1 \
+    MEMOCHAIN_CHECKPOINT= \
     MEMOCHAIN_STORE_ROOT=/data/sessions \
     MEMOCHAIN_READER_BACKEND=hybrid \
+    MEMOCHAIN_READER_MAX_TOKENS=4096 \
     MEMOCHAIN_RECALL_TOP_K=4 \
     MEMOCHAIN_MAX_CHUNKS=2000
 

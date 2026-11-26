@@ -6,14 +6,14 @@ services:
       - "9002:9000"
     environment:
       MEMOCHAIN_BACKEND_BASE_URL: http://host.docker.internal:8000/v1
-      MEMOCHAIN_CHECKPOINT: /checkpoints/student
+      # MEMOCHAIN_CHECKPOINT: /checkpoints/student
       MEMOCHAIN_STORE_ROOT: /data/sessions
       MEMOCHAIN_READER_BACKEND: hybrid
       MEMOCHAIN_HOT_LIMIT: "8000"
       MEMOCHAIN_KEEP_MIN: "4000"
       MEMOCHAIN_RECALL_TOP_K: "4"
     volumes:
-      - ./checkpoints:/checkpoints:ro
+      # - ./checkpoints:/checkpoints:ro
       - memochain-bench-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"

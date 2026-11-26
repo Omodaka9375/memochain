@@ -101,16 +101,24 @@ the teacher's memory gain at 181.8x compression. See DESIGN.md Phase 10.
 By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus an int8-quantized, FIFO-capped per-session SQLite chunk store (default 2,000 chunks, ~7 MB max/session) alongside the exact 22 KB Q14 capsule and SHA-256 receipt chain.
 
 ```bash
-# Docker (recommended: starts :9000 local + :9001 OpenRouter on a shared /data volume)
+# Docker (recommended: starts :9000 local + :9001 OpenRouter on a shared /data volume, zero downloads)
 docker compose up -d
 
-# Or directly via Python
+# Or directly via Python (no checkpoint required; uses built-in deterministic Q14 writer)
 uv sync --extra proxy
 PYTHONPATH=src python -m memochain.server \
     --backend-base-url http://localhost:8000/v1 \
-    --checkpoint runs/e2e_qwen06b_pv4 \
     --port 9000
 ```
+
+Pass `--checkpoint path/to/weights.bin` (or a directory with `weights.bin`,
+`np_*.npy`, or `student.pt`) when pairing the proxy with a trained neural
+reader or SP1 proof verification. Without `--checkpoint`, MemoChain uses a
+built-in fixed-seed Q14 writer so the proxy boots immediately and still
+produces exact 22 KB capsules and SHA-256 receipt chains. For reasoning-heavy
+models (which spend tokens thinking before emitting the bullet summary), set
+`--reader-model` / `MEMOCHAIN_READER_MODEL` to a fast non-reasoning model or
+raise `--reader-max-tokens` (default 4096).
 
 Point any OpenAI client at `http://localhost:9000/v1` (local) or
 `http://localhost:9001/v1` (OpenRouter), or any Anthropic `/v1/messages`
