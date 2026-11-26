@@ -1,6 +1,6 @@
 services:
   memochain-bench:
-    image: memochain:latest
+    image: ghcr.io/omodaka9375/memochain:latest
     container_name: memochain-bench
     ports:
       - "9002:9000"

@@ -101,7 +101,16 @@ the teacher's memory gain at 181.8x compression. See DESIGN.md Phase 10.
 By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus an int8-quantized, FIFO-capped per-session SQLite chunk store (default 2,000 chunks, ~7 MB max/session) alongside the exact 22 KB Q14 capsule and SHA-256 receipt chain.
 
 ```bash
-# Docker (recommended: starts :9000 local + :9001 OpenRouter on a shared /data volume, zero downloads)
+# Quickest: pull and run the published multi-arch image (amd64 + arm64, zero downloads)
+docker run -d --name memochain -p 9000:9000 \
+    --add-host=host.docker.internal:host-gateway \
+    -v memochain-data:/data \
+    -e MEMOCHAIN_BACKEND_BASE_URL=http://host.docker.internal:8000/v1 \
+    ghcr.io/omodaka9375/memochain:latest
+curl http://localhost:9000/healthz
+
+# Or Docker Compose (starts :9000 local + :9001 OpenRouter on a shared /data volume)
+git clone https://github.com/Omodaka9375/memochain && cd memochain
 docker compose up -d
 
 # Or directly via Python (no checkpoint required; uses built-in deterministic Q14 writer)

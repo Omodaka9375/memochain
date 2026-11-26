@@ -20,7 +20,7 @@ services:
       # add --build-arg WITH_READER=1 if you want --reader-backend transformers
       args:
         WITH_READER: "0"
-    image: memochain:latest
+    image: ghcr.io/omodaka9375/memochain:latest
     container_name: memochain
     ports:
       - "9000:9000"
@@ -60,7 +60,7 @@ services:
     restart: unless-stopped
 
   memochain-openrouter:
-    image: memochain:latest
+    image: ghcr.io/omodaka9375/memochain:latest
     container_name: memochain-openrouter
     ports:
       - "9001:9000"

@@ -634,12 +634,21 @@
         <div class="os-panel active" data-os="proxy">
           <div class="os-card">
             <h4>Single-container memory proxy (hybrid default)</h4>
-            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet. Bundled compose runs both <code>:9000</code> (local) and <code>:9001</code> (OpenRouter) on one shared session volume.</p>
+            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet. Zero downloads required on first boot. Point your client at <code>http://localhost:9000/v1</code> (local) or <code>http://localhost:9001/v1</code> (OpenRouter).</p>
             <div class="codebox">
-            <pre># Docker (starts :9000 local + :9001 OpenRouter, ~55 MB RAM each, 0 GPU)
+            <pre># Quickest: run the published multi-arch image (amd64 + arm64, ~55 MB RAM, 0 GPU)
+docker run -d --name memochain -p 9000:9000 \
+    --add-host=host.docker.internal:host-gateway \
+    -v memochain-data:/data \
+    -e MEMOCHAIN_BACKEND_BASE_URL=http://host.docker.internal:8000/v1 \
+    ghcr.io/omodaka9375/memochain:latest
+curl http://localhost:9000/healthz
+
+# Or run both :9000 (local) + :9001 (OpenRouter) sharing one session volume
+git clone https://github.com/Omodaka9375/memochain &amp;&amp; cd memochain
 docker compose up -d
 
-# Or directly via Python
+# Or directly via Python (no Docker)
 uv sync --extra proxy
 PYTHONPATH=src python -m memochain.server \
     --backend-base-url http://localhost:8000/v1 --port 9000</pre>
@@ -648,7 +657,7 @@ PYTHONPATH=src python -m memochain.server \
             <div class="os-meta">
               <span>Endpoints <b>/v1/chat/completions · /v1/messages · /v1/memochain/verify</b></span>
               <span>Footprint <b>~55 MB RAM · 0 GPU</b></span>
-              <span>Hot window <b>80k / 40k tokens</b></span>
+              <span>Platforms <b>linux/amd64 · linux/arm64</b></span>
             </div>
           </div>
         </div>
