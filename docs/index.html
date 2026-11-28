@@ -421,7 +421,7 @@
         <a href="#start">Start</a>
       </span>
       <span class="topbar-right">
-        <span><span id="heroVersion">v0.1.0</span> · <b>★ open source</b></span>
+        <span><span id="heroVersion">v0.2.0</span> · <b>★ open source</b></span>
         <span class="topbar-modes" role="group" aria-label="Colour mode">
           <button class="modebtn" type="button" data-mode="light" aria-pressed="false">Paper</button>
           <button class="modebtn" type="button" data-mode="dark" aria-pressed="true">Ink</button>
@@ -511,7 +511,7 @@
             <tr><td>proxy</td><td><b>OpenAI + Anthropic APIs + BYOK.</b> Drop-in proxy on <code>/v1/chat/completions</code> and native <code>/v1/messages</code> (Claude Code, OpenRouter, direct Anthropic, vLLM, llama.cpp, Ollama) with client key pass-through.</td></tr>
             <tr><td>container</td><td><b>Single slim container + shared sessions.</b> ~51–57 MB RAM, 0 extra GPU, 235 MB image, 2-second boot. Default hybrid mode pairs the 22 KB Q14 capsule with a rolling fact sheet and int8 SQLite chunk recall (capped at 2,000 chunks). Two containers sharing a volume carry the same <code>x-session-id</code> seamlessly across local and cloud models.</td></tr>
             <tr><td>audit</td><td><b>Background proofs.</b> The proxy's proof queue replays each fold in the zkVM and verifies the capsule against its SHA-256 receipt chain via <code>/v1/memochain/verify</code>.</td></tr>
-            <tr><td>tests</td><td><b>76 Python + 14 Rust tests.</b> Core and proxy run on any CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
+            <tr><td>tests</td><td><b>95 Python + 14 Rust tests.</b> Core and proxy run on any CPU; training fits a 12 GB GPU; proofs run on Linux/ARM.</td></tr>
           </tbody>
         </table>
       </div>
@@ -620,10 +620,10 @@
         </div>
         <h2>Run it in four commands.</h2>
         <p class="lead">
-          Core + 76 tests on a laptop CPU; single-container hybrid proxy in
-          ~55 MB RAM for local models, OpenRouter, or Claude (with shared
-          cross-model sessions); training on a single 12 GB GPU; proofs on
-          Linux/ARM.
+          Core + 95 tests on a laptop CPU; single-container hybrid proxy in
+          ~55 MB RAM for local models, OpenRouter, Claude, or Gemini (with
+          auto cloud/local profiles and shared cross-model sessions); training
+          on a single 12 GB GPU; proofs on Linux/ARM.
         </p>
         <div class="os-tabs" role="tablist" id="osTabs">
           <button class="os-tab" role="tab" data-os="proxy" aria-selected="true">Proxy</button>
@@ -634,7 +634,7 @@
         <div class="os-panel active" data-os="proxy">
           <div class="os-card">
             <h4>Single-container memory proxy (hybrid default)</h4>
-            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, or Anthropic. Keeps recent 80k tokens verbatim, folds overflow into the 22 KB capsule + int8 SQLite recall + rolling fact sheet. Zero downloads required on first boot. Point your client at <code>http://localhost:9000/v1</code> (local) or <code>http://localhost:9001/v1</code> (OpenRouter).</p>
+            <p>Drop-in layer in front of vLLM, llama.cpp, Ollama, OpenRouter, Anthropic, or Gemini. Auto-tunes cloud (96k/32k, cache hints, cheap fold routing) vs local (28k/12k) profiles, keeps cloud prompt caches warm via split static/dynamic injection, folds overflow asynchronously into the 22 KB capsule + SQLite FTS5/RRF recall + append-only facts ledger. Zero downloads required on first boot. Point your client at <code>http://localhost:9000/v1</code> (local) or <code>http://localhost:9001/v1</code> (OpenRouter).</p>
             <div class="codebox">
             <pre># Quickest: run the published multi-arch image (amd64 + arm64, ~55 MB RAM, 0 GPU)
 docker run -d --name memochain -p 9000:9000 \
@@ -667,7 +667,7 @@ PYTHONPATH=src python -m memochain.server \
             <p>Fold, read, verify, tamper-check, benchmark. No torch, no GPU, no downloads.</p>
             <div class="codebox">
             <pre>uv sync --extra dev
-uv run pytest          # 76 Python tests (torch tests skip if absent)
+uv run pytest          # 95 Python tests (torch tests skip if absent)
 uv run demo.py</pre>
             <button class="copy" type="button" aria-label="Copy commands">Copy</button>
             </div>
