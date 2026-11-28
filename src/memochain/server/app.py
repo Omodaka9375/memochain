@@ -419,17 +419,249 @@ def _backend_auth_headers(backend_base_url: str, backend_api_key: str | None) ->
     return {"Authorization": f"Bearer {backend_api_key}"}
 
 
-def _merge_anthropic_system(system_field: Any, memory_block: str) -> Any:
-    """Append the memory block to Anthropic's top-level ``system`` (string or blocks)."""
+def _merge_anthropic_system(
+    system_field: Any, memory_block: str, *, cache_control: bool = False
+) -> Any:
+    """Append the static memory block to Anthropic's top-level ``system``.
+
+    When ``cache_control=True``, returns structured text blocks with an
+    ``ephemeral`` cache breakpoint on the static prefix so Anthropic caches
+    system prompt + durable fact sheet across turns between folds.
+    """
     if not memory_block:
         return system_field
-    if system_field is None:
+    if not cache_control:
+        if system_field is None:
+            return memory_block
+        if isinstance(system_field, str):
+            return f"{system_field}\n\n{memory_block}" if system_field else memory_block
+        if isinstance(system_field, list):
+            return list(system_field) + [{"type": "text", "text": memory_block}]
         return memory_block
-    if isinstance(system_field, str):
-        return f"{system_field}\n\n{memory_block}" if system_field else memory_block
-    if isinstance(system_field, list):
-        return list(system_field) + [{"type": "text", "text": memory_block}]
-    return memory_block
+
+    blocks: list[dict[str, Any]] = []
+    if isinstance(system_field, str) and system_field:
+        blocks.append({"type": "text", "text": system_field})
+    elif isinstance(system_field, list):
+        for item in system_field:
+            if isinstance(item, dict):
+                blocks.append(dict(item))
+            elif isinstance(item, str) and item:
+                blocks.append({"type": "text", "text": item})
+    blocks.append(
+        {"type": "text", "text": memory_block, "cache_control": {"type": "ephemeral"}}
+    )
+    return blocks
+
+
+def _is_anthropic_target(backend_base_url: str, model: str | None = None) -> bool:
+    url = (backend_base_url or "").lower()
+    if "api.anthropic.com" in url:
+        return True
+    if "openrouter.ai" in url and isinstance(model, str) and "anthropic/" in model.lower():
+        return True
+    return False
+
+
+def _is_openai_direct_target(backend_base_url: str) -> bool:
+    return "api.openai.com" in (backend_base_url or "").lower()
+
+
+def _is_gemini_target(backend_base_url: str, model: str | None = None) -> bool:
+    url = (backend_base_url or "").lower()
+    if "generativelanguage.googleapis.com" in url or "aiplatform.googleapis.com" in url:
+        return True
+    if "openrouter.ai" in url and isinstance(model, str) and "google/" in model.lower():
+        return True
+    return False
+
+
+def _detect_backend_kind(backend_base_url: str) -> str:
+    """Classify backend URL into a known provider kind (cloud vs local)."""
+    url = (backend_base_url or "").lower()
+    if "api.anthropic.com" in url:
+        return "anthropic"
+    if "api.openai.com" in url:
+        return "openai"
+    if "openrouter.ai" in url:
+        return "openrouter"
+    if "generativelanguage.googleapis.com" in url or "aiplatform.googleapis.com" in url:
+        return "gemini"
+    if any(h in url for h in ("api.deepseek.com", "api.x.ai", "api.groq.com", "api.together.xyz", "api.fireworks.ai")):
+        return "cloud_openai"
+    return "local"
+
+
+_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "cloud": {
+        "hot_limit": 96000,
+        "keep_min": 32000,
+        "cache_passthrough": True,
+        "cache_hints": True,
+        "compact_tool_outputs": True,
+        "async_fold": True,
+        "cheap_fold_routing": True,
+    },
+    "local": {
+        "hot_limit": 28000,
+        "keep_min": 12000,
+        "cache_passthrough": False,
+        "cache_hints": False,
+        "compact_tool_outputs": True,
+        "async_fold": True,
+        "cheap_fold_routing": False,
+    },
+}
+
+
+def resolve_profile_config(
+    backend_base_url: str,
+    profile: str = "auto",
+) -> dict[str, Any]:
+    """Resolve effective profile ('cloud' or 'local') and tuned defaults."""
+    kind = _detect_backend_kind(backend_base_url)
+    prof = (profile or "auto").strip().lower()
+    if prof == "auto":
+        effective = "local" if kind == "local" else "cloud"
+    elif prof in _PROFILE_DEFAULTS:
+        effective = prof
+    else:
+        raise ValueError(f"Unknown profile {profile!r}; expected 'auto', 'cloud', or 'local'")
+    cfg = dict(_PROFILE_DEFAULTS[effective])
+    cfg["profile"] = effective
+    cfg["backend_kind"] = kind
+    return cfg
+
+
+def suggest_cheap_fold_model(backend_base_url: str, request_model: str | None) -> str | None:
+    """Suggest a 10-20x cheaper, fast non-reasoning model on the SAME backend
+    for hybrid fold fact-sheet extraction when the main chat uses a frontier model.
+
+    Returns None when the request model is already cheap/fast, unknown, or local.
+    """
+    if not request_model:
+        return None
+    kind = _detect_backend_kind(backend_base_url)
+    m = request_model.strip().lower()
+    if kind == "local":
+        return None
+    # Already a cheap/mini/flash/haiku tier -> keep as-is (token-bounded so 'gemini' != 'mini')
+    import re as _re
+
+    if _re.search(r"(?:^|[-_/.])(haiku|mini|nano|flash|flash-lite|8b|7b)(?:$|[-_/.])", m):
+        return None
+    if kind == "anthropic":
+        if "opus" in m or "sonnet" in m:
+            return "claude-haiku-4-5"
+    elif kind == "openai":
+        if any(tok in m for tok in ("gpt-5", "gpt-4o", "gpt-4.1", "o1", "o3", "o4")):
+            return "gpt-4o-mini"
+    elif kind == "gemini":
+        if "pro" in m:
+            return "gemini-2.5-flash"
+    elif kind == "openrouter":
+        if m.startswith("anthropic/") and ("opus" in m or "sonnet" in m):
+            return "anthropic/claude-haiku-4.5"
+        if m.startswith("openai/") and any(tok in m for tok in ("gpt-5", "gpt-4o", "gpt-4.1", "o1", "o3", "o4")):
+            return "openai/gpt-4o-mini"
+        if m.startswith("google/") and "pro" in m:
+            return "google/gemini-2.5-flash"
+    return None
+
+
+def _apply_anthropic_message_cache_breakpoint(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Place an Anthropic ``cache_control`` breakpoint on the last stable
+    pre-turn non-system message (the second-to-last message, i.e. right before
+    the newest user turn) when no explicit cache breakpoint is already present
+    on any non-system message.
+    """
+    if len(messages) < 2:
+        return messages
+    # Respect caller-supplied cache_control breakpoints on non-system messages.
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        c = m.get("content")
+        if isinstance(c, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in c
+        ):
+            return messages
+    out = [dict(m) for m in messages]
+    idx = len(out) - 2
+    if out[idx].get("role") == "system":
+        return out
+    target = dict(out[idx])
+    content = target.get("content")
+    if isinstance(content, str) and content:
+        target["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+        out[idx] = target
+    elif isinstance(content, list) and content:
+        blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        last_block = blocks[-1]
+        if isinstance(last_block, dict):
+            last_block["cache_control"] = {"type": "ephemeral"}
+            target["content"] = blocks
+            out[idx] = target
+    return out
+
+
+def _apply_openai_cache_hints(
+    out_body: dict[str, Any],
+    backend_base_url: str,
+    session_id: str,
+    *,
+    stream: bool,
+    cache_hints: bool,
+) -> None:
+    """Attach safe provider cache hints on OpenAI-compatible requests."""
+    if not cache_hints:
+        return
+    if _is_openai_direct_target(backend_base_url):
+        out_body.setdefault("prompt_cache_key", f"memochain:{session_id}")
+        if stream:
+            opts = dict(out_body.get("stream_options") or {})
+            opts.setdefault("include_usage", True)
+            out_body["stream_options"] = opts
+    elif _is_anthropic_target(backend_base_url, out_body.get("model")):
+        # OpenRouter Anthropic routes honor Anthropic cache_control on system
+        # and message content blocks.
+        msgs = out_body.get("messages")
+        if isinstance(msgs, list) and msgs:
+            out_msgs = [dict(m) for m in msgs]
+            if out_msgs[0].get("role") == "system":
+                sys_c = out_msgs[0].get("content")
+                if isinstance(sys_c, str) and sys_c:
+                    out_msgs[0]["content"] = [
+                        {
+                            "type": "text",
+                            "text": sys_c,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ]
+                elif isinstance(sys_c, list) and sys_c:
+                    blocks = [dict(b) if isinstance(b, dict) else b for b in sys_c]
+                    if isinstance(blocks[-1], dict) and "cache_control" not in blocks[-1]:
+                        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+                    out_msgs[0]["content"] = blocks
+            out_body["messages"] = _apply_anthropic_message_cache_breakpoint(out_msgs)
+        if stream:
+            opts = dict(out_body.get("stream_options") or {})
+            opts.setdefault("include_usage", True)
+            out_body["stream_options"] = opts
+    elif _is_gemini_target(backend_base_url, out_body.get("model")) and stream:
+        # Gemini OpenAI-compat endpoint returns usage in SSE when requested;
+        # prefix caching activates implicitly on stable leading blocks.
+        opts = dict(out_body.get("stream_options") or {})
+        opts.setdefault("include_usage", True)
+        out_body["stream_options"] = opts
+    elif "openrouter.ai" in (backend_base_url or "").lower() and stream:
+        opts = dict(out_body.get("stream_options") or {})
+        opts.setdefault("include_usage", True)
+        out_body["stream_options"] = opts
 
 
 class HybridReaderAdapter:
@@ -438,8 +670,9 @@ class HybridReaderAdapter:
 
     Runs inside the slim numpy-only container with zero extra GPU memory and
     zero reader-model boot. Supports OpenAI ``/chat/completions`` and Anthropic
-    ``/messages`` backends (direct Anthropic API or OpenRouter). Falls back to
-    the deterministic profile digest if the backend call fails.
+    ``/messages`` backends (direct Anthropic API, OpenAI, Gemini OpenAI-compat,
+    OpenRouter, or local servers). Optionally routes fold calls to a cheaper
+    fast tier on the same backend (with automatic fallback to ``model_hint``).
     """
 
     def __init__(
@@ -450,6 +683,7 @@ class HybridReaderAdapter:
         timeout: float = 60.0,
         reader_model: str | None = None,
         max_tokens: int = 4096,
+        cheap_fold_routing: bool = False,
     ) -> None:
         headers = _backend_auth_headers(backend_base_url, backend_api_key)
         self.backend_base_url = backend_base_url
@@ -459,6 +693,10 @@ class HybridReaderAdapter:
         self._pinned_model: str | None = reader_model
         self._model_id: str | None = reader_model
         self._prefer_messages = "api.anthropic.com" in backend_base_url
+        self.cheap_fold_routing = bool(cheap_fold_routing)
+        self.last_call_fallback: bool = False
+        self.last_used_model: str | None = None
+        self.fallback_count: int = 0
 
     def _pick_model(
         self, model_hint: str | None = None, auth_headers: dict[str, str] | None = None
@@ -466,6 +704,10 @@ class HybridReaderAdapter:
         if self._pinned_model:
             return self._pinned_model
         if model_hint:
+            if self.cheap_fold_routing:
+                cheap = suggest_cheap_fold_model(self.backend_base_url, model_hint)
+                if cheap:
+                    return cheap
             return model_hint
         if self._model_id:
             return self._model_id
@@ -482,6 +724,13 @@ class HybridReaderAdapter:
     def read(self, state, query_embed, prev_summary: str) -> str:
         return prev_summary or _profile_digest(state, query_embed, prev_summary)
 
+    def _invoke_model(
+        self, model: str, prompt: str, auth_headers: dict[str, str] | None = None
+    ) -> str:
+        if self._prefer_messages:
+            return self._call_messages(model, prompt, auth_headers=auth_headers)
+        return self._call_chat_completions(model, prompt, auth_headers=auth_headers)
+
     def read_fold(
         self,
         state,
@@ -491,30 +740,40 @@ class HybridReaderAdapter:
         model_hint: str | None = None,
         auth_headers: dict[str, str] | None = None,
     ) -> str:
+        self.last_call_fallback = False
+        self.last_used_model = None
         if not folded_entries:
             return prev_summary
         model = self._pick_model(model_hint=model_hint, auth_headers=auth_headers)
         if not model:
-            return _profile_digest(state, query_embed, prev_summary)
+            self.last_call_fallback = True
+            self.fallback_count += 1
+            return prev_summary or _profile_digest(state, query_embed, prev_summary)
 
         turns = "\n".join(f"[{role}] {text}" for _, role, text in folded_entries)
         prompt = (
-            f"Merge the existing notes and the new transcript lines below into one clean bullet list "
-            f"(max {self.max_words} words). Keep concrete entities, names, cities, ports, hosts, URLs, "
-            f"package/tool names, file paths, decisions, and preferences verbatim. "
-            f"Output only the bullet points with no preamble or commentary.\n\n"
+            f"Update the bullet-point fact sheet below using the new transcript lines "
+            f"(max {self.max_words} words). Preserve ALL existing concrete facts, names, "
+            f"cities, ports, hosts, URLs, codes, package/tool names, file paths, decisions, "
+            f"and preferences verbatim unless explicitly superseded by a newer turn. "
+            f"Output only `- key: value` bullet points with no preamble or commentary.\n\n"
             f"Existing notes:\n{prev_summary or '(none)'}\n\n"
             f"Transcript lines:\n{turns}"
         )
-        try:
-            if self._prefer_messages:
-                text = self._call_messages(model, prompt, auth_headers=auth_headers)
-            else:
-                text = self._call_chat_completions(model, prompt, auth_headers=auth_headers)
-            if text:
-                return text
-        except Exception:
-            pass
+        candidates = [model]
+        if model_hint and model != model_hint and not self._pinned_model:
+            # If the auto-routed cheap model is unavailable/rejected, fall back to active model_hint
+            candidates.append(model_hint)
+        for cand in candidates:
+            try:
+                text = self._invoke_model(cand, prompt, auth_headers=auth_headers)
+                if text:
+                    self.last_used_model = cand
+                    return text
+            except Exception:
+                continue
+        self.last_call_fallback = True
+        self.fallback_count += 1
         return prev_summary or _profile_digest(state, query_embed, prev_summary)
 
     def _call_chat_completions(
@@ -629,6 +888,194 @@ class SessionManager:
 
 
 # --------------------------------------------------------------------------
+# Cache-aware telemetry & passthrough
+# --------------------------------------------------------------------------
+
+_CACHE_HIT_KEYS = (
+    "cache_read_input_tokens",
+    "cached_tokens",
+    "prompt_cache_hit_tokens",
+    "cache_read_tokens",
+    "cachedContentTokenCount",
+)
+
+
+def _extract_usage_from_payload(payload: Any) -> dict[str, Any] | None:
+    """Extract a usage dict from OpenAI, Anthropic, Gemini, or SSE event payloads."""
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if isinstance(usage, dict) and usage:
+        return usage
+    # Anthropic SSE `message_start` nests usage under `message.usage`
+    msg = payload.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("usage"), dict) and msg["usage"]:
+        return msg["usage"]
+    # Gemini native responses expose `usageMetadata`
+    umeta = payload.get("usageMetadata")
+    if isinstance(umeta, dict) and umeta:
+        return umeta
+    return None
+
+
+def _cache_hit_ratio(payload: Any) -> float | None:
+    """Return (cached / total_input) for OpenAI, Anthropic, DeepSeek, OpenRouter,
+    or Gemini responses (non-streaming or SSE event), or None if unreported."""
+    usage = _extract_usage_from_payload(payload)
+    if not isinstance(usage, dict):
+        return None
+
+    # OpenAI / OpenRouter structured prompt_tokens_details
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    cached: float | None = None
+    if isinstance(details, dict):
+        for k in ("cached_tokens", "cached_tokens_count", "cache_read_tokens"):
+            v = details.get(k)
+            if isinstance(v, (int, float)):
+                cached = float(v)
+                break
+    if cached is None:
+        for key in _CACHE_HIT_KEYS:
+            v = usage.get(key)
+            if isinstance(v, (int, float)):
+                cached = float(v)
+                break
+    if cached is None:
+        return None
+
+    # Anthropic's `input_tokens` excludes cache_read + cache_creation tokens;
+    # sum all three so the ratio is cached / total_prompt_tokens.
+    if "cache_read_input_tokens" in usage and "prompt_tokens" not in usage:
+        inp = (
+            float(usage.get("input_tokens") or 0)
+            + float(usage.get("cache_read_input_tokens") or 0)
+            + float(usage.get("cache_creation_input_tokens") or 0)
+        )
+    else:
+        inp = float(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or usage.get("promptTokenCount")
+            or 0
+        )
+    if inp <= 0:
+        return None
+    return min(1.0, max(0.0, cached / inp))
+
+
+def _record_cache_hit(
+    session_state: dict[str, Any],
+    hit_ratio: float | None,
+    threshold: float,
+) -> None:
+    """Update per-session cache telemetry and consecutive high-hit streak."""
+    session_state["last_cache_hit"] = hit_ratio
+    if hit_ratio is not None and hit_ratio >= threshold:
+        session_state["passthrough_streak"] = session_state.get("passthrough_streak", 0) + 1
+    else:
+        session_state["passthrough_streak"] = 0
+
+
+def _is_passthrough(session_state: dict[str, Any], streak_needed: int) -> bool:
+    return session_state.get("passthrough_streak", 0) >= max(1, int(streak_needed))
+
+
+def _reset_passthrough(session_state: dict[str, Any]) -> None:
+    session_state["passthrough_streak"] = 0
+    session_state["last_cache_hit"] = None
+
+
+def _extract_token_counts(payload: Any) -> tuple[int, int, float | None]:
+    """Return (total_input_tokens, cached_input_tokens, provider_cost_usd_or_None)."""
+    usage = _extract_usage_from_payload(payload)
+    if not isinstance(usage, dict):
+        return 0, 0, None
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    cached = 0
+    if isinstance(details, dict):
+        for k in ("cached_tokens", "cached_tokens_count", "cache_read_tokens"):
+            v = details.get(k)
+            if isinstance(v, (int, float)):
+                cached = int(v)
+                break
+    if cached == 0:
+        for key in _CACHE_HIT_KEYS:
+            v = usage.get(key)
+            if isinstance(v, (int, float)):
+                cached = int(v)
+                break
+    if "cache_read_input_tokens" in usage and "prompt_tokens" not in usage:
+        inp = (
+            int(usage.get("input_tokens") or 0)
+            + int(usage.get("cache_read_input_tokens") or 0)
+            + int(usage.get("cache_creation_input_tokens") or 0)
+        )
+    else:
+        inp = int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or usage.get("promptTokenCount")
+            or 0
+        )
+    raw_cost = usage.get("cost")
+    cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
+    return max(0, inp), max(0, min(inp, cached)), cost
+
+
+def _record_session_economics(
+    session_state: dict[str, Any],
+    raw_prompt_tokens: int,
+    sent_prompt_tokens: int,
+    usage_payload: Any,
+) -> dict[str, Any]:
+    """Accumulate per-session token, cache, and cost-savings telemetry."""
+    econ = session_state.setdefault(
+        "economics",
+        {
+            "turns": 0,
+            "raw_input_tokens": 0,
+            "proxied_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "reported_cost_usd": 0.0,
+            "has_reported_cost": False,
+        },
+    )
+    inp, cached, cost = _extract_token_counts(usage_payload)
+    actual_in = inp if inp > 0 else sent_prompt_tokens
+    econ["turns"] += 1
+    econ["raw_input_tokens"] += max(actual_in, int(raw_prompt_tokens))
+    econ["proxied_input_tokens"] += actual_in
+    econ["cached_input_tokens"] += cached
+    if cost is not None:
+        econ["reported_cost_usd"] += cost
+        econ["has_reported_cost"] = True
+    return _economics_snapshot(econ)
+
+
+def _economics_snapshot(econ: dict[str, Any]) -> dict[str, Any]:
+    raw_in = max(1, int(econ.get("raw_input_tokens") or 0))
+    prox_in = int(econ.get("proxied_input_tokens") or 0)
+    cached = int(econ.get("cached_input_tokens") or 0)
+    uncached = max(0, prox_in - cached)
+    saved_tokens = max(0, raw_in - prox_in)
+    # Effective uncached-equivalent tokens (assuming standard 0.1x cache read price)
+    eff_prox = uncached + 0.1 * cached
+    out: dict[str, Any] = {
+        "turns": int(econ.get("turns") or 0),
+        "raw_input_tokens": int(econ.get("raw_input_tokens") or 0),
+        "proxied_input_tokens": prox_in,
+        "cached_input_tokens": cached,
+        "tokens_saved": saved_tokens,
+        "token_savings_pct": round(100.0 * saved_tokens / raw_in, 1),
+        "cache_hit_pct": round(100.0 * cached / max(1, prox_in), 1),
+        "effective_input_tokens": int(round(eff_prox)),
+    }
+    if econ.get("has_reported_cost"):
+        out["reported_cost_usd"] = round(float(econ["reported_cost_usd"]), 6)
+    return out
+
+
+# --------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------
 
@@ -642,8 +1089,8 @@ def create_app(
     embedding_api_key: str | None = None,
     reader_decoder: str = "Qwen/Qwen3-8B",
     reader_device: str = "cpu",
-    hot_limit: int = 80000,
-    keep_min: int = 40000,
+    hot_limit: int | None = None,
+    keep_min: int | None = None,
     writer: Any | None = None,
     reader: Any | None = None,
     embed_fn: Any | None = None,
@@ -658,9 +1105,64 @@ def create_app(
     max_chunks: int = 2000,
     reader_model: str | None = None,
     reader_max_tokens: int = 4096,
+    max_doc_chars: int = 2000,
+    profile: str | None = None,
+    cache_passthrough: bool | None = None,
+    cache_passthrough_threshold: float = 0.5,
+    cache_passthrough_streak: int = 2,
+    cache_hints: bool | None = None,
+    async_fold: bool | None = None,
+    compact_tool_outputs: bool | None = None,
+    tool_archive_min_chars: int = 1500,
+    tool_keep_recent_groups: int = 4,
+    cheap_fold_routing: bool | None = None,
 ) -> "FastAPI":
     if not FASTAPI_OK:  # pragma: no cover
         raise ImportError("fastapi is required for the proxy: uv sync --extra proxy")
+
+    prof_cfg = resolve_profile_config(backend_base_url, profile or "auto")
+    active_profile = prof_cfg["profile"]
+    backend_kind = prof_cfg["backend_kind"]
+
+    # When profile is explicitly passed ("auto"/"cloud"/"local"), profile defaults
+    # fill any unset knobs; when profile is None (direct programmatic create_app),
+    # keep legacy defaults so existing tests/callers behave identically.
+    use_profile = profile is not None
+    eff_hot_limit = (
+        hot_limit
+        if hot_limit is not None
+        else (prof_cfg["hot_limit"] if use_profile else 80000)
+    )
+    eff_keep_min = (
+        keep_min
+        if keep_min is not None
+        else (prof_cfg["keep_min"] if use_profile else 40000)
+    )
+    eff_cache_passthrough = (
+        cache_passthrough
+        if cache_passthrough is not None
+        else (prof_cfg["cache_passthrough"] if use_profile else True)
+    )
+    eff_cache_hints = (
+        cache_hints
+        if cache_hints is not None
+        else (prof_cfg["cache_hints"] if use_profile else True)
+    )
+    eff_async_fold = (
+        async_fold
+        if async_fold is not None
+        else (prof_cfg["async_fold"] if use_profile else False)
+    )
+    eff_compact_tools = (
+        compact_tool_outputs
+        if compact_tool_outputs is not None
+        else (prof_cfg["compact_tool_outputs"] if use_profile else True)
+    )
+    eff_cheap_fold = (
+        cheap_fold_routing
+        if cheap_fold_routing is not None
+        else (prof_cfg["cheap_fold_routing"] if use_profile else False)
+    )
 
     writer = writer or IntWriterAdapter(checkpoint)
     if reader is None:
@@ -676,6 +1178,7 @@ def create_app(
                 backend_api_key=backend_api_key,
                 reader_model=reader_model,
                 max_tokens=reader_max_tokens,
+                cheap_fold_routing=eff_cheap_fold,
             )
     if recall_top_k is None:
         recall_top_k = 4 if reader_backend == "hybrid" else 0
@@ -691,14 +1194,19 @@ def create_app(
         writer=writer,
         embed_fn=embed_fn,
         reader=reader,
-        hot_limit=hot_limit,
-        keep_min=keep_min,
+        hot_limit=eff_hot_limit,
+        keep_min=eff_keep_min,
         recall_top_k=recall_top_k,
         max_chunks=max_chunks,
+        max_doc_chars=max_doc_chars,
+        async_fold=eff_async_fold,
+        compact_tool_outputs=eff_compact_tools,
+        tool_archive_min_chars=tool_archive_min_chars,
+        tool_keep_recent_groups=tool_keep_recent_groups,
     )
 
     backend_headers = _backend_auth_headers(backend_base_url, backend_api_key)
-    app = FastAPI(title="MemoChain memory proxy", version="0.1.0")
+    app = FastAPI(title="MemoChain memory proxy", version="0.2.0")
     client = backend_client or httpx.AsyncClient(
         base_url=backend_base_url, timeout=None, headers=backend_headers
     )
@@ -717,6 +1225,12 @@ def create_app(
         )
 
     sessions.session_kwargs["proof_queue"] = proofs
+
+    # per-session cache passthrough state
+    _passthrough_state: dict[str, dict[str, Any]] = {}
+
+    def _session_state(sid: str | None) -> dict[str, Any]:
+        return _passthrough_state.setdefault(sid or "__default__", {})
 
     # backend served-model cache (for model-name normalization + /v1/models)
     _model_cache: dict[str, Any] = {"ids": None, "ts": 0.0}
@@ -754,6 +1268,15 @@ def create_app(
         return {
             "ok": True,
             "backend": backend_base_url,
+            "backend_kind": backend_kind,
+            "profile": active_profile,
+            "hot_limit": eff_hot_limit,
+            "keep_min": eff_keep_min,
+            "async_fold": eff_async_fold,
+            "cheap_fold_routing": eff_cheap_fold,
+            "compact_tool_outputs": eff_compact_tools,
+            "cache_hints": eff_cache_hints,
+            "cache_passthrough": eff_cache_passthrough,
             "sessions": len(sessions.sessions),
             "proof_mode": proof_mode,
             "weights_source": getattr(writer, "weights_source", "custom"),
@@ -770,6 +1293,7 @@ def create_app(
             or body.get("user")
         )
         messages: list[dict[str, Any]] = body.get("messages") or []
+        raw_prompt_tokens = sum(estimate_tokens(message_text(m)) for m in messages)
         mem = sessions.get(session_id, messages)
 
         # normalize any requested model name to the backend's served model,
@@ -780,18 +1304,47 @@ def create_app(
             body["model"] = backend_ids[0]
 
         req_headers = _forward_auth_headers(request, backend_base_url)
-        rewritten, stats = mem.process(
-            messages, model_hint=body.get("model"), auth_headers=req_headers
+        sess_state = _session_state(mem.session_id)
+        cache_hit = (
+            _is_passthrough(sess_state, cache_passthrough_streak)
+            if eff_cache_passthrough
+            else False
         )
+        rewritten, stats = mem.process(
+            messages,
+            model_hint=body.get("model"),
+            auth_headers=req_headers,
+            passthrough=cache_hit,
+        )
+        sent_prompt_tokens = sum(estimate_tokens(message_text(m)) for m in rewritten)
+        if sess_state.get("last_cache_hit") is not None:
+            stats["last_cache_hit_ratio"] = round(float(sess_state["last_cache_hit"]), 4)
         out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
         out_body["messages"] = rewritten
         stream = bool(out_body.get("stream"))
+        _apply_openai_cache_hints(
+            out_body,
+            backend_base_url,
+            mem.session_id,
+            stream=stream,
+            cache_hints=eff_cache_hints,
+        )
 
         if not stream:
             resp = await client.post("/chat/completions", json=out_body, headers=req_headers)
             if resp.status_code != 200:
                 return _error_json_response(resp.text, resp.status_code)
             payload = resp.json()
+            hit = _cache_hit_ratio(payload)
+            if eff_cache_passthrough:
+                _record_cache_hit(sess_state, hit, cache_passthrough_threshold)
+            elif hit is not None:
+                sess_state["last_cache_hit"] = hit
+            if hit is not None:
+                stats["cache_hit_ratio"] = round(hit, 4)
+            stats["economics"] = _record_session_economics(
+                sess_state, raw_prompt_tokens, sent_prompt_tokens, payload
+            )
             payload["memochain"] = _stats_block(mem, stats)
             return JSONResponse(payload)
 
@@ -809,10 +1362,22 @@ def create_app(
                     yield f"data: {json.dumps(_parse_error_payload(err, resp.status_code))}\n\n".encode()
                     return
                 last_chunk: dict[str, Any] | None = None
+                usage_chunk: dict[str, Any] | None = None
+                stream_hit: float | None = None
+                saw_usage = False
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
+                            if eff_cache_passthrough and saw_usage:
+                                _record_cache_hit(sess_state, stream_hit, cache_passthrough_threshold)
+                            elif stream_hit is not None:
+                                sess_state["last_cache_hit"] = stream_hit
+                            if stream_hit is not None:
+                                stats["cache_hit_ratio"] = round(stream_hit, 4)
+                            stats["economics"] = _record_session_economics(
+                                sess_state, raw_prompt_tokens, sent_prompt_tokens, usage_chunk
+                            )
                             if last_chunk is not None:
                                 last_chunk["memochain"] = _stats_block(mem, stats)
                                 yield f"data: {json.dumps(last_chunk)}\n\n".encode()
@@ -823,8 +1388,19 @@ def create_app(
                             parsed = json.loads(data)
                             if isinstance(parsed, dict):
                                 last_chunk = parsed
+                                if _extract_usage_from_payload(parsed) is not None:
+                                    saw_usage = True
+                                    usage_chunk = parsed
+                                    hit = _cache_hit_ratio(parsed)
+                                    if hit is not None:
+                                        stream_hit = hit
                         except ValueError:
                             pass
+                if eff_cache_passthrough and saw_usage:
+                    _record_cache_hit(sess_state, stream_hit, cache_passthrough_threshold)
+                _record_session_economics(
+                    sess_state, raw_prompt_tokens, sent_prompt_tokens, usage_chunk
+                )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -838,6 +1414,7 @@ def create_app(
             or body.get("session_id")
         )
         messages: list[dict[str, Any]] = body.get("messages") or []
+        raw_prompt_tokens = sum(estimate_tokens(message_text(m)) for m in messages)
         mem = sessions.get(session_id, messages)
 
         requested = body.get("model")
@@ -846,17 +1423,38 @@ def create_app(
             body["model"] = backend_ids[0]
 
         req_headers = _forward_anthropic_headers(request, backend_base_url)
+        sess_state = _session_state(mem.session_id)
+        cache_hit = (
+            _is_passthrough(sess_state, cache_passthrough_streak)
+            if eff_cache_passthrough
+            else False
+        )
         rewritten, stats = mem.process(
             messages,
             model_hint=body.get("model"),
             inject_memory=False,
             auth_headers=req_headers,
+            passthrough=cache_hit,
         )
+        if sess_state.get("last_cache_hit") is not None:
+            stats["last_cache_hit_ratio"] = round(float(sess_state["last_cache_hit"]), 4)
         out_body = {k: v for k, v in body.items() if k not in ("session_id",)}
+        # Cache-safe split injection for Anthropic /v1/messages:
+        #   - static fact sheet -> top-level `system` (with ephemeral cache_control when targeting Anthropic)
+        #   - dynamic per-turn recall -> tail user message (never invalidates system/prefix cache)
+        static_block = stats.get("static_memory_block", "")
+        dynamic_block = stats.get("dynamic_memory_block", "")
+        if dynamic_block:
+            rewritten = SessionMemory.inject_dynamic_recall(rewritten, dynamic_block)
+        ant_cache = bool(eff_cache_hints and _is_anthropic_target(backend_base_url, body.get("model")))
+        if static_block:
+            out_body["system"] = _merge_anthropic_system(
+                out_body.get("system"), static_block, cache_control=ant_cache
+            )
+        if ant_cache:
+            rewritten = _apply_anthropic_message_cache_breakpoint(rewritten)
         out_body["messages"] = rewritten
-        memory_block = stats.get("memory_block", "")
-        if memory_block:
-            out_body["system"] = _merge_anthropic_system(out_body.get("system"), memory_block)
+        sent_prompt_tokens = sum(estimate_tokens(message_text(m)) for m in rewritten)
 
         stream = bool(out_body.get("stream"))
 
@@ -865,6 +1463,16 @@ def create_app(
             if resp.status_code != 200:
                 return _anthropic_error_response(resp.text, resp.status_code)
             payload = resp.json()
+            hit = _cache_hit_ratio(payload)
+            if eff_cache_passthrough:
+                _record_cache_hit(sess_state, hit, cache_passthrough_threshold)
+            elif hit is not None:
+                sess_state["last_cache_hit"] = hit
+            if hit is not None:
+                stats["cache_hit_ratio"] = round(hit, 4)
+            stats["economics"] = _record_session_economics(
+                sess_state, raw_prompt_tokens, sent_prompt_tokens, payload
+            )
             payload["memochain"] = _stats_block(mem, stats)
             return JSONResponse(payload)
 
@@ -876,8 +1484,29 @@ def create_app(
                     err = (await resp.aread()).decode("utf-8", "replace")
                     yield f"event: error\ndata: {json.dumps(_parse_error_payload(err, resp.status_code))}\n\n".encode()
                     return
+                stream_hit: float | None = None
+                usage_chunk: dict[str, Any] | None = None
+                saw_usage = False
                 async for line in resp.aiter_lines():
                     yield f"{line}\n".encode()
+                    if line.startswith("data: "):
+                        try:
+                            parsed = json.loads(line[6:])
+                            if isinstance(parsed, dict) and _extract_usage_from_payload(parsed) is not None:
+                                saw_usage = True
+                                usage_chunk = parsed
+                                hit = _cache_hit_ratio(parsed)
+                                if hit is not None:
+                                    stream_hit = hit
+                        except ValueError:
+                            pass
+                if eff_cache_passthrough and saw_usage:
+                    _record_cache_hit(sess_state, stream_hit, cache_passthrough_threshold)
+                elif stream_hit is not None:
+                    sess_state["last_cache_hit"] = stream_hit
+                _record_session_economics(
+                    sess_state, raw_prompt_tokens, sent_prompt_tokens, usage_chunk
+                )
 
         return StreamingResponse(gen_anthropic(), media_type="text/event-stream")
 
@@ -885,8 +1514,22 @@ def create_app(
     async def status(session_id: str) -> dict[str, Any]:
         mem = sessions.get_by_id(session_id)
         st = mem.verify()
+        st["profile"] = active_profile
+        st["backend_kind"] = backend_kind
         st["summary"] = mem.summary
         st["folded_messages"] = len(mem.folded_hashes)
+        st["fold_fallback_count"] = mem.fold_fallback_count
+        st["fold_shrink_guard_count"] = mem.fold_shrink_guard_count
+        st["last_fold_fallback"] = mem.last_fold_fallback
+        st["fold_in_progress"] = mem._fold_in_progress
+        st["compacted_tools_count"] = len(mem.compacted_stubs)
+        sess_state = _session_state(mem.session_id)
+        if "economics" in sess_state:
+            st["economics"] = _economics_snapshot(sess_state["economics"])
+        if mem.chunk_store is not None:
+            st["chunks_count"] = mem.chunk_store.count()
+            st["facts_count"] = mem.chunk_store.facts_count()
+            st["fts_enabled"] = mem.chunk_store.fts_enabled
         if proofs is not None:
             st["proof"] = proofs.status(mem.session_id)
         return st
@@ -905,6 +1548,8 @@ def create_app(
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        for mem in list(sessions.sessions.values()):
+            mem.wait_for_pending_fold(timeout=15.0)
         await client.aclose()
 
     return app
@@ -976,7 +1621,7 @@ def _error_json_response(raw_text: str, status_code: int) -> "JSONResponse":
 
 
 def _stats_block(mem: SessionMemory, stats: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "session_id": stats.get("session_id"),
         "step": mem.head.step if mem.head else 0,
         "capsule_bytes": mem.capsule_path.stat().st_size if mem.capsule_path.exists() else 0,
@@ -986,7 +1631,18 @@ def _stats_block(mem: SessionMemory, stats: dict[str, Any]) -> dict[str, Any]:
         "hot_messages": stats.get("hot_messages"),
         "hot_tokens": stats.get("hot_tokens"),
         "recalled_chunks": stats.get("recalled_chunks", 0),
+        "fold_fallback_count": mem.fold_fallback_count,
+        "fold_shrink_guard_count": mem.fold_shrink_guard_count,
+        **({"tool_compactions": stats["tool_compactions"]} if stats.get("tool_compactions") else {}),
+        **({"passthrough": True} if stats.get("passthrough") else {}),
     }
+    if "cache_hit_ratio" in stats:
+        out["cache_hit_ratio"] = stats["cache_hit_ratio"]
+    elif "last_cache_hit_ratio" in stats:
+        out["last_cache_hit_ratio"] = stats["last_cache_hit_ratio"]
+    if "economics" in stats:
+        out["economics"] = stats["economics"]
+    return out
 
 
 def _hash_embed(texts: list[str]) -> np.ndarray:
@@ -1055,21 +1711,35 @@ def main() -> None:
         help="max stored SQLite chunks per session (ring buffer cap, 0 = unlimited, default 2000)",
     )
     parser.add_argument(
+        "--max-doc-chars",
+        type=int,
+        default=int(_env("MEMOCHAIN_MAX_DOC_CHARS", "2000")),
+        help="chars kept per stored chunk before embedding (default 2000; raise for long notes so facts deep in a document stay recallable)",
+    )
+    parser.add_argument(
         "--reader-sidecar-url",
         default=_env("MEMOCHAIN_READER_SIDECAR_URL"),
         help="reader sidecar base URL (e.g. http://localhost:8002) for natural-language memory notes",
     )
     parser.add_argument(
+        "--profile",
+        default=_env("MEMOCHAIN_PROFILE", "auto"),
+        choices=["auto", "cloud", "local"],
+        help="tuning profile: auto (detect from backend URL), cloud (96k/32k, cache hints + cheap fold model), or local (28k/12k, VRAM/TTFT optimized)",
+    )
+    _hl = _env("MEMOCHAIN_HOT_LIMIT")
+    parser.add_argument(
         "--hot-limit",
         type=int,
-        default=int(_env("MEMOCHAIN_HOT_LIMIT", "80000")),
-        help="conversation hot-window token limit (excluding system prompt)",
+        default=int(_hl) if _hl is not None else None,
+        help="conversation hot-window token limit (defaults from --profile: 96000 cloud / 28000 local)",
     )
+    _km = _env("MEMOCHAIN_KEEP_MIN")
     parser.add_argument(
         "--keep-min",
         type=int,
-        default=int(_env("MEMOCHAIN_KEEP_MIN", "40000")),
-        help="min conversation tokens kept hot after folding",
+        default=int(_km) if _km is not None else None,
+        help="min conversation tokens kept hot after folding (defaults from --profile: 32000 cloud / 12000 local)",
     )
     parser.add_argument(
         "--proof-mode",
@@ -1090,6 +1760,59 @@ def main() -> None:
         type=int,
         default=int(_env("MEMOCHAIN_READER_MAX_TOKENS", "4096")),
         help="max_tokens for hybrid fold-summary call (default 4096 to give reasoning models headroom)",
+    )
+    _cp = _env("MEMOCHAIN_CACHE_PASSTHROUGH")
+    parser.add_argument(
+        "--cache-passthrough",
+        action=argparse.BooleanOptionalAction,
+        default=(_cp.lower() not in ("0", "false", "no", "off")) if _cp is not None else None,
+        help="stop folding/injecting when backend reports high prompt-cache hit rate (default from --profile)",
+    )
+    parser.add_argument(
+        "--cache-passthrough-threshold",
+        type=float,
+        default=float(_env("MEMOCHAIN_CACHE_PASSTHROUGH_THRESHOLD", "0.5")),
+        help="cache hit ratio required to enter passthrough (default 0.5)",
+    )
+    parser.add_argument(
+        "--cache-passthrough-streak",
+        type=int,
+        default=int(_env("MEMOCHAIN_CACHE_PASSTHROUGH_STREAK", "2")),
+        help="consecutive high-hit responses required before passthrough (default 2)",
+    )
+    _ch = _env("MEMOCHAIN_CACHE_HINTS")
+    parser.add_argument(
+        "--cache-hints",
+        action=argparse.BooleanOptionalAction,
+        default=(_ch.lower() not in ("0", "false", "no", "off")) if _ch is not None else None,
+        help="attach provider cache hints (Anthropic cache_control, OpenAI prompt_cache_key, stream usage; default from --profile)",
+    )
+    _af = _env("MEMOCHAIN_ASYNC_FOLD")
+    parser.add_argument(
+        "--async-fold",
+        action=argparse.BooleanOptionalAction,
+        default=(_af.lower() not in ("0", "false", "no", "off")) if _af is not None else None,
+        help="run fold summary calls in a background thread so fold turns add zero latency (default from --profile: enabled)",
+    )
+    _tc = _env("MEMOCHAIN_TOOL_COMPACTION")
+    parser.add_argument(
+        "--tool-compaction",
+        action=argparse.BooleanOptionalAction,
+        default=(_tc.lower() not in ("0", "false", "no", "off")) if _tc is not None else None,
+        help="compact superseded file reads and old oversized tool outputs at overflow boundaries (default from --profile: enabled)",
+    )
+    parser.add_argument(
+        "--tool-archive-min-chars",
+        type=int,
+        default=int(_env("MEMOCHAIN_TOOL_ARCHIVE_MIN_CHARS", "1500")),
+        help="min char size before an old tool output is archived into ChunkStore at overflow boundaries (default 1500)",
+    )
+    _cfr = _env("MEMOCHAIN_CHEAP_FOLD_ROUTING")
+    parser.add_argument(
+        "--cheap-fold-routing",
+        action=argparse.BooleanOptionalAction,
+        default=(_cfr.lower() not in ("0", "false", "no", "off")) if _cfr is not None else None,
+        help="route cloud fold summaries to a fast cheap model on the same provider (default: enabled on cloud profile)",
     )
     parser.add_argument("--host", default=_env("MEMOCHAIN_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(_env("MEMOCHAIN_PORT", "9000")))
@@ -1117,8 +1840,18 @@ def main() -> None:
         reader_backend=args.reader_backend,
         recall_top_k=args.recall_top_k,
         max_chunks=args.max_chunks,
+        max_doc_chars=args.max_doc_chars,
         reader_model=args.reader_model,
         reader_max_tokens=args.reader_max_tokens,
+        profile=args.profile,
+        cache_passthrough=args.cache_passthrough,
+        cache_passthrough_threshold=args.cache_passthrough_threshold,
+        cache_passthrough_streak=args.cache_passthrough_streak,
+        cache_hints=args.cache_hints,
+        async_fold=args.async_fold,
+        compact_tool_outputs=args.tool_compaction,
+        tool_archive_min_chars=args.tool_archive_min_chars,
+        cheap_fold_routing=args.cheap_fold_routing,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

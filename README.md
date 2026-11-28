@@ -39,19 +39,22 @@ state digests in Python, native Rust, and the SP1 zkVM.
   STARK proves the whole 200-doc fold (1.24 MiB, ~24 min prove on DGX
   Spark) and a +1-doc recursive step costs 33.8M cycles; anyone verifies
   in ~28 ms.
-- **OpenAI + Anthropic memory proxy** (`server/`): single ~55 MB RAM,
+- **OpenAI + Anthropic + Gemini memory proxy** (`server/`): single ~55 MB RAM,
   zero-GPU container sitting in front of any local or cloud backend
   (`/v1/chat/completions` + native `/v1/messages`, BYOK key pass-through).
   Folds overflow into the 22 KB capsule + SHA-256 receipt chain, pairs it
-  with hybrid recall (rolling fact sheet + int8 FIFO-capped SQLite chunks),
-  shares sessions across local and cloud containers via one `/data` volume,
-  and runs the optional SP1 proof queue in the background.
+  with cache-safe split injection (static fact sheet + append-only facts
+  ledger in system prompt, dynamic FTS5+vector RRF recall in the tail user
+  message), compacts repeated file reads and oversized tool outputs at
+  overflow boundaries, runs folds asynchronously in the background, auto-tunes
+  cloud vs local profiles, shares sessions across containers via one `/data`
+  volume, and runs the optional SP1 proof queue in the background.
 
 ## Quickstart
 
 ```bash
 uv sync --extra dev
-uv run pytest              # 76 Python tests (torch tests skip if absent) + 14 Rust tests
+uv run pytest              # 95 Python tests (torch tests skip if absent) + 14 Rust tests
 uv run demo.py             # fold, read, verify, tamper-check, benchmark
 ```
 
@@ -96,9 +99,24 @@ reference numbers (Qwen3-8B decoder, pv4/test): 22 KB capsule 64.67% vs
 Memorilla teacher 64.76% (4.10 MB KV cache) vs closed-book 58.58% - 98.5% of
 the teacher's memory gain at 181.8x compression. See DESIGN.md Phase 10.
 
-## Memory proxy (OpenAI + Anthropic, BYOK, shared sessions)
+Small-GPU reference (Qwen3-0.6B decoder, teacher-free, same 22,606 B capsule;
+DESIGN.md Phase 22): 8-dataset 6k-step 32-memory student trained from scratch
+in ~1 h on one GB10 / ~2.2 h on an RTX 3060 12 GB reaches **+7.31pp over
+closed-book on pv4/test** (58.20 vs 50.89) and **+12.02pp on unseen pmv2/test**
+(38.06 vs 26.02) - transfer exceeding the 8B-era pv4-trained student (+7.4pp)
+at 13x smaller decoder. The same sweep shows what does NOT help: more steps
+(10k pv4-only overfit and scored below the 1k run) - data diversity and memory
+token count are the levers that moved every metric.
 
-By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`): zero extra GPU or reader sidecar, using the active backend model for a rolling fact sheet plus an int8-quantized, FIFO-capped per-session SQLite chunk store (default 2,000 chunks, ~7 MB max/session) alongside the exact 22 KB Q14 capsule and SHA-256 receipt chain.
+## Memory proxy (OpenAI + Anthropic + Gemini, BYOK, shared sessions)
+
+By default the proxy runs in **hybrid reader-free mode** (`--reader-backend hybrid`, `--recall-top-k 4`, `--profile auto`): zero extra GPU or reader sidecar, pairing the exact 22 KB Q14 capsule and SHA-256 receipt chain with:
+
+- **Cache-safe split injection**: static fact sheet + append-only facts ledger stay byte-stable in the system prompt; per-turn recalled chunks attach to the tail user message so provider prompt caches stay warm.
+- **FTS5 + dense vector RRF search**: int8-quantized SQLite chunks (`--max-chunks 2000`, ~7 MB max/session) with identifier-aware scoring, insert-time near-duplicate suppression, and hit-based priority eviction.
+- **Overflow tool compaction + async folding**: supersedes duplicate `read_file` outputs, archives huge tool dumps into SQLite, and runs fold summaries in a background thread so fold turns add zero latency.
+- **Auto cloud/local profiles**: `--profile auto` (`MEMOCHAIN_PROFILE=auto`) picks `cloud` (96k/32k window, provider cache hints, cache passthrough, cheap fold-model routing) vs `local` (28k/12k window, VRAM/TTFT tuned) from the backend URL.
+- **Per-session economics telemetry**: `/v1/memochain/status` and response `memochain.economics` report raw vs proxied tokens, cache-hit %, and provider-reported USD cost.
 
 ```bash
 # Quickest: pull and run the published multi-arch image (amd64 + arm64, zero downloads)
@@ -156,21 +174,26 @@ Supported backends via `MEMOCHAIN_BACKEND_BASE_URL` / `--backend-base-url`:
 - **OpenRouter**: `https://openrouter.ai/api/v1` (BYOK pass-through or
   `MEMOCHAIN_BACKEND_API_KEY`).
 - **Direct Anthropic**: `https://api.anthropic.com/v1`.
+- **Direct Gemini (OpenAI-compat)**: `https://generativelanguage.googleapis.com/v1beta/openai`.
 
 Sessions start with zero memory overhead; once the conversation exceeds
-`--hot-limit` tokens (default 80,000, conversation only; folding down to
-40,000) the oldest turns fold into the 22 KB capsule, recalled facts +
-top-K verbatim chunks are injected into the system prompt, and the
-optional SP1 queue replays the fold in the background
-(`/v1/memochain/verify` reports capsule, receipt chain, and proof status).
-Optional flags: `--reader-backend transformers` (in-process neural reader),
-`--reader-backend profile` (numpy recall profile only), `--reader-sidecar-url`,
-`--embedding-base-url`, `--max-chunks`, and `--proof-mode execute`.
+`--hot-limit` tokens (auto-tuned via `--profile auto`: 96,000 -> 32,000 for
+cloud backends, 28,000 -> 12,000 for local backends) the oldest turns fold
+asynchronously into the 22 KB capsule, static notes + append-only facts stay
+cache-pinned in the system prompt, dynamic top-K FTS5+vector chunks attach
+to the tail user turn, and the optional SP1 queue replays the fold in the
+background (`/v1/memochain/verify` reports capsule, receipt chain, and proof
+status). Optional flags: `--profile auto|cloud|local`, `--no-async-fold`,
+`--no-tool-compaction`, `--cheap-fold-routing`, `--cache-hints`,
+`--cache-passthrough`, `--reader-backend transformers` (in-process neural
+reader), `--reader-backend profile` (numpy recall profile only),
+`--reader-sidecar-url`, `--embedding-base-url`, `--max-chunks`, and
+`--proof-mode execute`.
 
-Measured savings (`tools/benchmark_savings.py`, 120-turn identical session,
-backend-metered `usage.prompt_tokens`): 7,086,360 input tokens direct vs
-674,016 through the proxy (**90% reduction**, final-turn prompt 117,125 to
-6,746 tokens). See `tools/bench_results/savings_report.md`.
+Measured savings:
+- **120-turn live proxy benchmark** (`tools/benchmark_savings.py`, backend-metered `usage.prompt_tokens`): 7,086,360 input tokens direct vs 674,016 through the proxy (**90% reduction**, final-turn prompt 117,125 to 6,746 tokens). See `tools/bench_results/savings_report.md`.
+- **60-turn live OpenRouter DeepSeek v3.2 A/B** (`tools/bench_results_openrouter/`): 919,770 -> 245,181 input tokens (-73%), billed cost $0.1252 -> $0.0416 (**-66.8%** even with automatic prompt caching).
+- **4-arm cache-aware matrix** (`tools/benchmark_matrix.py`, `tools/bench_results/phase_d_matrix.json`, 150-turn long chat + 60-turn tool-heavy coding agent): cache-safe split injection turns cloud cost from a legacy regression ($2.06 vs $1.98 raw on Sonnet) into **-32% cloud / -40% local** with 25/25 + 10/10 fact recall.
 
 ## ZK proofs (Linux / SP1)
 
@@ -199,9 +222,8 @@ input-token reduction. Everything except the Qwen3-8B benchmarks runs on a
 12 GB GPU or CPU only. See [DESIGN.md](DESIGN.md) for the phase-by-phase
 results and negative results.
 
-Test suite (CPU-only machine, torch absent): 56 Python tests collected,
-55 passed / 6 skipped (6 skips are torch-only tests); on a torch-enabled
-host all 74 collected Python tests run. Rust: 14 tests across
+Test suite: 95 Python tests passing on a torch-enabled host (torch-only
+tests skip cleanly when torch is absent). Rust: 14 tests across
 `memochain-core` (10) and `chain-logic` (4). Both suites run without GPU.
 
 Deployment: multi-arch image published to

@@ -1,13 +1,14 @@
-# MemoChain memory proxy: one container in front of any OpenAI-compatible
-# or Anthropic backend. Point clients at :9000 (local) or :9001 (OpenRouter).
+# MemoChain memory proxy (v0.2.0): one container in front of any OpenAI-compatible,
+# OpenRouter, Anthropic, or Gemini backend. Point clients at :9000 (local) or :9001 (OpenRouter).
 #
 #   docker compose up -d
 #   curl localhost:9000/healthz
 #
 # Works out of the box with zero downloads (built-in deterministic Q14 writer +
-# hybrid fact-sheet + SQLite recall). To use trained neural-reader weights,
-# place weights.bin (or exported np_*.npy) under ./checkpoints/student and
-# uncomment the checkpoints volume + MEMOCHAIN_CHECKPOINT below.
+# cache-safe split injection + SQLite FTS5/RRF recall + append-only facts ledger +
+# overflow tool compaction + async background folding + auto cloud/local profile).
+# To use trained neural-reader weights, place weights.bin (or exported np_*.npy)
+# under ./checkpoints/student and uncomment the checkpoints volume + MEMOCHAIN_CHECKPOINT below.
 #
 # Optional services / overrides:
 #  - embedding:  real Qwen3-Embedding-4B via vLLM (else offline hash-embed)
@@ -27,9 +28,9 @@ services:
     environment:
       # Pick one backend (default: local OpenAI-compatible server like vLLM/llama.cpp/Ollama/LM Studio):
       MEMOCHAIN_BACKEND_BASE_URL: http://host.docker.internal:8000/v1
-      # MEMOCHAIN_BACKEND_API_KEY: ""                                   # optional for local; required for OpenRouter/Anthropic
+      # MEMOCHAIN_BACKEND_API_KEY: ""                                   # optional for local; required for OpenRouter/Anthropic/Gemini
 
-      # Preset: OpenRouter (Claude, GPT, Gemini, Qwen, etc.)
+      # Preset: OpenRouter (Claude, GPT, Gemini, Qwen, DeepSeek, etc.)
       # MEMOCHAIN_BACKEND_BASE_URL: https://openrouter.ai/api/v1
       # MEMOCHAIN_BACKEND_API_KEY: sk-or-v1-...
 
@@ -37,21 +38,36 @@ services:
       # MEMOCHAIN_BACKEND_BASE_URL: https://api.anthropic.com/v1
       # MEMOCHAIN_BACKEND_API_KEY: sk-ant-...
 
+      # Preset: Direct Gemini (OpenAI-compatible endpoint)
+      # MEMOCHAIN_BACKEND_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      # MEMOCHAIN_BACKEND_API_KEY: AIza...
+
+      # Auto profile selects tuned defaults from backend URL:
+      #   local -> 28k hot / 12k keep, async fold, tool compaction (VRAM/TTFT tuned)
+      #   cloud -> 96k hot / 32k keep, cache hints, cache passthrough, cheap fold routing
+      # Override with "cloud" or "local", or set individual knobs below.
+      MEMOCHAIN_PROFILE: auto
+      # MEMOCHAIN_HOT_LIMIT: "28000"
+      # MEMOCHAIN_KEEP_MIN: "12000"
+      # MEMOCHAIN_ASYNC_FOLD: "true"
+      # MEMOCHAIN_TOOL_COMPACTION: "true"
+      # MEMOCHAIN_CHEAP_FOLD_ROUTING: "false"
+      # MEMOCHAIN_CACHE_HINTS: "false"
+      # MEMOCHAIN_CACHE_PASSTHROUGH: "false"
+
       # Optional: mount trained weights (weights.bin or np_*.npy) for neural reader / SP1 parity.
       # When omitted or missing, MemoChain uses its built-in deterministic Q14 writer.
       # MEMOCHAIN_CHECKPOINT: /checkpoints/student
       MEMOCHAIN_STORE_ROOT: /data/sessions
-      MEMOCHAIN_READER_BACKEND: hybrid                                  # default: backend fact sheet + top-K chunk recall
+      MEMOCHAIN_READER_BACKEND: hybrid                                  # default: backend fact sheet + FTS5/RRF chunk recall
       # MEMOCHAIN_READER_MODEL: ""                                      # optional: pin a fast non-reasoning model for fold summaries
       # MEMOCHAIN_READER_MAX_TOKENS: "4096"
       # MEMOCHAIN_RECALL_TOP_K: "4"
-      # MEMOCHAIN_MAX_CHUNKS: "2000"                                    # ring-buffer cap on int8 SQLite chunks (~7 MB max/session)
+      # MEMOCHAIN_MAX_CHUNKS: "2000"                                    # hit-weighted SQLite chunk cap (~7 MB max/session)
       # MEMOCHAIN_EMBEDDING_BASE_URL: http://embedding:8001/v1          # uncomment with the service below
       # MEMOCHAIN_READER_BACKEND: transformers
       # MEMOCHAIN_READER_DECODER: Qwen/Qwen3-0.6B
       # MEMOCHAIN_READER_DEVICE: cpu
-      # MEMOCHAIN_HOT_LIMIT: "80000"
-      # MEMOCHAIN_KEEP_MIN: "40000"
     volumes:
       # - ./checkpoints:/checkpoints:ro
       - memochain-data:/data
@@ -66,16 +82,17 @@ services:
       - "9001:9000"
     environment:
       MEMOCHAIN_BACKEND_BASE_URL: https://openrouter.ai/api/v1
+      MEMOCHAIN_PROFILE: auto                                           # resolves to cloud (96k/32k, cache hints, cheap fold routing)
       # MEMOCHAIN_BACKEND_API_KEY: sk-or-v1-...                         # optional: clients can pass their own key (BYOK)
       # MEMOCHAIN_CHECKPOINT: /checkpoints/student
       MEMOCHAIN_STORE_ROOT: /data/sessions
       MEMOCHAIN_READER_BACKEND: hybrid
-      # MEMOCHAIN_READER_MODEL: ""                                      # optional: e.g. a fast non-reasoning model for fold summaries
+      # MEMOCHAIN_READER_MODEL: ""                                      # optional: overrides auto cheap fold-model routing
       # MEMOCHAIN_READER_MAX_TOKENS: "4096"
       # MEMOCHAIN_RECALL_TOP_K: "4"
       # MEMOCHAIN_MAX_CHUNKS: "2000"
-      # MEMOCHAIN_HOT_LIMIT: "80000"
-      # MEMOCHAIN_KEEP_MIN: "40000"
+      # MEMOCHAIN_HOT_LIMIT: "96000"
+      # MEMOCHAIN_KEEP_MIN: "32000"
     volumes:
       # - ./checkpoints:/checkpoints:ro
       - memochain-data:/data                                            # shared session memory with :9000

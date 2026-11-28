@@ -373,8 +373,13 @@ def test_hybrid_read_fold_and_chunk_retrieval(tmp_path) -> None:
     sys_content = out[0]["content"]
     assert "[Durable memory]" in sys_content
     assert "- city: Lisbon" in sys_content
-    assert "Relevant verbatim turns recalled" in sys_content
-    assert "ZEBRA-42" in sys_content
+    # Cache-safe split: per-turn recalled chunks go on the tail user message,
+    # keeping messages[0] byte-identical across turns between folds.
+    assert "Relevant verbatim turns recalled" not in sys_content
+    tail_user = out[-1]["content"]
+    assert "[Recalled memory]" in tail_user
+    assert "Relevant verbatim turns recalled" in tail_user
+    assert "ZEBRA-42" in tail_user
     assert s.verify()["ok"] is True
 
 
@@ -606,13 +611,23 @@ def test_anthropic_messages_endpoint_and_direct_reader(tmp_path, monkeypatch) ->
     sent = backend_calls[0]
     assert sent["url"] == "/messages"
     assert sent["headers"]["x-api-key"] == "sk-ant-client"
-    assert "Be concise." in sent["json"]["system"]
-    assert "[Durable memory]" in sent["json"]["system"]
-    assert "- uses claude direct" in sent["json"]["system"]
+    # Direct Anthropic receives structured system blocks with an ephemeral cache breakpoint
+    sys_blocks = sent["json"]["system"]
+    assert isinstance(sys_blocks, list)
+    sys_text = "\n".join(b["text"] for b in sys_blocks)
+    assert "Be concise." in sys_text
+    assert "[Durable memory]" in sys_text
+    assert "- uses claude direct" in sys_text
+    assert sys_blocks[-1].get("cache_control") == {"type": "ephemeral"}
+    # Dynamic recalled turns ride on the tail user message (not system)
+    assert "Relevant verbatim turns recalled" not in sys_text
+    assert "[Recalled memory]" in sent["json"]["messages"][-1]["content"]
     # first two turns folded; tool_use/tool_result pair + final user turn stay intact (3 msgs)
     assert len(sent["json"]["messages"]) == 3
     assert sent["json"]["messages"][0]["content"][0]["type"] == "tool_use"
     assert sent["json"]["messages"][1]["content"][0]["type"] == "tool_result"
+    # Second-to-last message gets an ephemeral cache breakpoint for prefix reuse
+    assert sent["json"]["messages"][1]["content"][-1].get("cache_control") == {"type": "ephemeral"}
 
 
 def test_messages_normalizes_model_for_local_vllm_backend(tmp_path) -> None:
@@ -847,7 +862,8 @@ def test_shared_volume_sync_from_disk_across_two_managers(tmp_path) -> None:
     out_cloud, stats_cloud = s_cloud_again.process(conv + [msg("user", "What is ALPHA-99?")])
     assert stats_cloud["fold"] is None  # already folded by local proxy, not re-folded
     assert stats_cloud["recalled_chunks"] >= 1
-    assert "ALPHA-99" in out_cloud[0]["content"]
+    assert "[Durable memory]" in out_cloud[0]["content"]
+    assert "ALPHA-99" in out_cloud[-1]["content"]
 
 
 def test_zero_config_deterministic_writer_and_weights_bin_loading(tmp_path) -> None:
